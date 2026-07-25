@@ -12,6 +12,7 @@
 """
 
 import time
+import random
 
 from llm.client import LLMClient
 from wechat.bot import WeChatBot
@@ -83,6 +84,7 @@ def main():
                 except Exception as e:
                     logger.error(f"处理消息失败: {e}", exc_info=True)
 
+            time.sleep(random.uniform(1, 2))
             time.sleep(POLL_INTERVAL)
 
     except KeyboardInterrupt:
