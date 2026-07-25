@@ -71,8 +71,9 @@ class WeChatBot:
         self._seen_messages: set = set()  # 已处理消息去重（保证每条只回复一次）
         self._session_snapshot: dict = {}  # 会话快照: {friend: "timestamp|last_content"}
         self._first_scan: bool = True  # 首次扫描标志，仅建立基线不拉消息
-        self._my_name: str = ""  # 当前用户昵称，用于过滤自己发的消息
-        self._sent_contents: set = set()  # 已发送消息内容集合，用于过滤自身消息
+        self._my_name: str = ""  # 当前用户昵称，记录自己是谁
+        self._sent_contents: set = set()  # 已发送/回复消息内容集合
+        self._sent_contents_ordered: list = []  # 保持插入顺序，用于淘汰旧记录
 
     def init_wechat(self) -> bool:
         """初始化微信连接，验证客户端已运行并登录"""
@@ -108,15 +109,16 @@ class WeChatBot:
             return False
 
     def _is_self_message(self, sender: str, content: str) -> bool:
-        """判断消息是否为自己发送的（发送者名称匹配 + 已发送内容匹配）"""
+        """判断消息是否为自己发送的（发送者名称匹配 + 已回复内容匹配）"""
         s = sender.strip()
+        # 策略1: 发送者是自己
         if s == "你":
             return True
         if self._my_name:
             my = self._my_name.strip()
             if s == my or my in s:
                 return True
-        # 内容命中已发送记录（规范化比较，容忍空白差异）
+        # 策略2: 内容命中已回复记录（规范化比较，容忍空白差异）
         content_norm = " ".join(content.strip().split())
         if content_norm:
             for sent in self._sent_contents:
@@ -148,7 +150,13 @@ class WeChatBot:
                 close_weixin=False,
             )
             # 记录已发送内容，防止下次轮询把自己的回复当成新消息
-            self._sent_contents.add(message.strip())
+            content = message.strip()
+            self._sent_contents.add(content)
+            self._sent_contents_ordered.append(content)
+            # 限制集合大小，淘汰最早的记录
+            while len(self._sent_contents_ordered) > 200:
+                old = self._sent_contents_ordered.pop(0)
+                self._sent_contents.discard(old)
             logger.info(f"消息已发送到 '{target}': {message[:50]}...")
             return True
         except Exception as e:
