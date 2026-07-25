@@ -13,6 +13,7 @@ pywechat 通过 pywinauto 自动化 Windows 微信客户端实现消息收发。
 """
 
 import logging
+import re
 import time
 from typing import List, Optional, Any
 
@@ -155,13 +156,18 @@ class WeChatBot:
             old = self._sent_contents_ordered.pop(0)
             self._sent_contents.discard(old)
 
+    @staticmethod
+    def _normalize(text: str) -> str:
+        """规范化文本：去除首尾空白，合并连续空白为单个空格"""
+        return re.sub(r"\s+", " ", text.strip())
+
     def _is_self_message(self, sender: str, content: str) -> bool:
         """
         判断消息是否为自己发送的（多层防御）
 
         判断策略:
             1. 发送者名称匹配（昵称 / "你" / 包含关系）
-            2. 消息内容命中已发送记录（最可靠，不依赖名称）
+            2. 消息内容命中已发送记录（规范化后模糊匹配，最可靠）
 
         Args:
             sender: 消息发送者名称
@@ -182,10 +188,12 @@ class WeChatBot:
                 if sender_stripped == my_name or my_name in sender_stripped:
                     return True
 
-        # --- 策略2: 内容命中已发送记录（不依赖名称，最可靠） ---
-        content_stripped = content.strip()
-        if content_stripped and content_stripped in self._sent_contents:
-            return True
+        # --- 策略2: 内容命中已发送记录（规范化后比较，容忍空白差异） ---
+        content_norm = self._normalize(content)
+        if content_norm:
+            for sent in self._sent_contents:
+                if self._normalize(sent) == content_norm:
+                    return True
 
         return False
 
@@ -212,24 +220,29 @@ class WeChatBot:
         if content.startswith("[草稿]"):
             content = content[len("[草稿]"):].strip()
 
-        # 直接匹配（私聊格式）
-        if content in self._sent_contents:
-            return True
+        content_norm = self._normalize(content)
+
+        # 直接匹配（私聊格式，规范化后比较）
+        for sent in self._sent_contents:
+            if self._normalize(sent) == content_norm:
+                return True
 
         # 群聊格式: "发送人: 消息内容"，去掉发送人前缀后再匹配
         if ": " in content:
             prefix, body = content.split(": ", 1)
-            body = body.strip()
-            if body and body in self._sent_contents:
-                # 进一步确认前缀是自己（避免误伤别人发的相同内容）
-                if self._my_name and (
-                    prefix.strip() == self._my_name.strip()
-                    or self._my_name.strip() in prefix.strip()
-                ):
-                    return True
-                # 前缀为 "你" 或无法确认时，仅当内容完全匹配已发送记录即认为自己的
-                if prefix.strip() == "你":
-                    return True
+            body_norm = self._normalize(body)
+            if body_norm:
+                for sent in self._sent_contents:
+                    if self._normalize(sent) == body_norm:
+                        # 进一步确认前缀是自己（避免误伤别人发的相同内容）
+                        if self._my_name and (
+                            prefix.strip() == self._my_name.strip()
+                            or self._my_name.strip() in prefix.strip()
+                        ):
+                            return True
+                        # 前缀为 "你" 即认为自己的
+                        if prefix.strip() == "你":
+                            return True
 
         return False
 
@@ -372,7 +385,8 @@ class WeChatBot:
             filtered_sessions = []
             for friend in changed_sessions:
                 last_content = str(snapshot_content_map.get(friend, "")).strip()
-                if last_content and last_content in self._sent_contents:
+                # 使用 _is_self_snapshot_content 处理群聊 "发送人: 内容" 前缀格式
+                if last_content and self._is_self_snapshot_content(last_content):
                     logger.debug(f"'{friend}' 最后一条是自己发的消息，跳过")
                     continue
                 filtered_sessions.append(friend)
@@ -409,16 +423,20 @@ class WeChatBot:
                             logger.debug(f"跳过自身消息: {msg}")
                             continue
 
-                        # 去重
-                        msg_key = f"{msg.sender}|{msg.content}|{msg.chat}"
+                        # 去重（规范化键：容忍 UI 自动化读取的空白差异）
+                        msg_key = (
+                            f"{self._normalize(msg.sender)}|"
+                            f"{self._normalize(msg.content)}|"
+                            f"{msg.chat.strip()}"
+                        )
                         if msg_key in self._seen_messages:
                             continue
                         self._seen_messages.add(msg_key)
 
-                        # 限制去重集合大小
-                        if len(self._seen_messages) > 500:
-                            self._seen_messages.clear()
-                            self._seen_messages.add(msg_key)
+                        # 限制去重集合大小（渐进淘汰，避免清空后旧消息重复返回）
+                        if len(self._seen_messages) > 1000:
+                            for _ in range(200):
+                                self._seen_messages.pop()
 
                         messages.append(msg)
                 except Exception as e:
