@@ -9,10 +9,14 @@
 import sys
 
 try:
-    from pyweixin import Tools, Messages, Navigator
+    from pyweixin import Tools, Messages, Navigator, GlobalConfig
 except ImportError:
-    print("未安装 pywechat，请运行: pip install pywechat127")
+    print("未安装 pywechat，请运行: pip install pywechat127 --user --no-cache-dir")
     sys.exit(1)
+
+# 全局配置：不关闭微信主窗口
+GlobalConfig.close_weixin = False
+GlobalConfig.is_maximize = False
 
 
 def test_login():
@@ -49,13 +53,19 @@ def test_send_message():
 
 
 def test_session_list():
-    """测试获取会话列表"""
+    """测试获取会话列表
+
+    使用 Messages.dump_sessions() 获取会话列表，
+    返回格式: [('发送人', '最后聊天时间', '最后聊天内容'), ...]
+    """
     print("=" * 50)
     print("【测试】获取会话列表")
     print("=" * 50)
     try:
-        sessions = Navigator.get_session_list()
-        print(f"当前会话列表：{sessions}")
+        sessions = Messages.dump_sessions(close_weixin=False)
+        print(f"当前会话列表（共 {len(sessions)} 个）：")
+        for s in sessions[:10]:  # 只显示前10个
+            print(f"  - {s[0]}  最后消息时间: {s[1]}  最后内容: {s[2][:30]}")
         print("✅ 获取会话列表测试通过\n")
         return True
     except Exception as e:

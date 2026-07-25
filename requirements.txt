@@ -11,7 +11,8 @@ pyyaml>=6.0
 openai>=1.12.0
 
 # 微信自动化 (仅 Windows, 需微信 4.1.x 客户端)
-wxauto4>=41.1.2
+# 安装命令: pip install pywechat127 --user --no-cache-dir
+pywechat127>=1.9.8
 
 # Web 服务 (如需后台管理)
 uvicorn>=0.27.0

@@ -5,14 +5,17 @@ pip install -r requirements.txt
 ````
 
 # 使用版本
-# `https://github.com/Hello-Mr-Crab/pywechat?utm_source=chatgpt.com`
+# 微信自动化库: pywechat127 (pyweixin 模块)
+# GitHub: https://github.com/Hello-Mr-Crab/pywechat
+# 安装: pip install pywechat127 --user --no-cache-dir
+# 适配微信版本: 4.1.x
+# Python: >=3.10
 # {'exe路径': 'D:\\software\\Weixin\\Weixin.exe', '版本': '4.1.8.107', '语言': '简体中文', 'wxid': 'wxid_eunjbg9vzjdr22_316', 'wxid目录': 'C:\\Users\\march\\xwechat_files\\wxid_eunjbg9vzjdr22_316b', '微信配置目录': 'D:\\software\\Weixin\\4.1.8.107', '聊天文件目录': 'C:\\Users\\march\\xwechat_files\\wxid_eunjbg9vzjdr22_316b\\msg\\file'}
 
 
-
 # 后期备选路线
-# 微信文档： https://docs.wxauto.org/docs/install.html
-# pip install wxauto4 # Name: wxauto4   # Version: 41.1.2
+# wxauto4 文档： https://docs.wxauto.org/docs/install.html
+# pip install wxauto4 # Name: wxauto4   # Version: 41.1.2 (已弃用，改用 pywechat127)
 # 微信版本 weixin_4.1.8.107
 
 

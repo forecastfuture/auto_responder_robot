@@ -273,7 +273,7 @@ class AutoResponderRobot:
             logger.error("请确保:")
             logger.error("  1. Windows 微信 PC 客户端正在运行")
             logger.error("  2. 微信已登录")
-            logger.error("  3. 已安装 wxauto4: pip install wxauto4")
+            logger.error("  3. 已安装 pywechat: pip install pywechat127 --user --no-cache-dir")
             return
 
         # 配置定时任务
@@ -293,7 +293,7 @@ class AutoResponderRobot:
                         self.process_message(msg)
                     except Exception as e:
                         logger.error(f"处理消息失败: {e}", exc_info=True)
-                time.sleep(3)  # 每 3 秒轮询一次
+                time.sleep(10)  # pyweixin 轮询间隔较长，避免频繁 UI 操作
         except KeyboardInterrupt:
             logger.info("收到停止信号，正在关闭...")
         except Exception as e:
