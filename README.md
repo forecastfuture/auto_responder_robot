@@ -1,2 +1,7 @@
-# auto_responder_robot
-自动回复机器人
+
+## 安装依赖
+```bash
+pip install -r requirements.txt 
+````
+
+

@@ -1,0 +1,25 @@
+/tem# Windows:
+*.png
+*.inp
+*.rpt
+*.out
+*.swp
+*.pyc
+*.html
+*.xlsx
+*.csv
+
+/venv/
+
+
+
+
+
+#Python:
+.idea
+*.egg
+*.egg-info
+.pytest_cache
+__pycache__
+
+test.py
