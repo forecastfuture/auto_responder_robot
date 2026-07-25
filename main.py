@@ -58,7 +58,6 @@ def main():
     logger.info("=" * 50)
 
     # --- 主循环：轮询消息 → 调用大模型 → 回复 ---
-    replied_keys: set = set()  # 已回复消息指纹，保证每条消息只回复一次
     try:
         while True:
             messages = wx_bot.get_messages()
@@ -72,12 +71,18 @@ def main():
                         logger.warning(f"非目标会话，跳过: [{target_chat}]")
                         continue
 
-                    # 消息指纹：同一条消息绝不重复回复（规范化空白，容忍 UI 读取差异）
+                    # 防御一：消息内容命中机器人已发送记录 → 自身消息，绝不回复
+                    # （防止自我回复死循环；持久化存储，重启后依然有效）
+                    if wx_bot.is_self_content(msg.content):
+                        logger.info(f"自身消息，跳过: {msg}")
+                        continue
+
+                    # 防御二：消息指纹（持久化），同一条消息绝不重复回复
                     fp_sender = re.sub(r"\s+", " ", msg.sender.strip())
                     fp_content = re.sub(r"\s+", " ", msg.content.strip())
                     msg_fingerprint = f"{fp_sender}|{fp_content}|{target_chat}"
-                    if msg_fingerprint in replied_keys:
-                        logger.debug(f"已回复过，跳过: {msg}")
+                    if wx_bot.is_replied(msg_fingerprint):
+                        logger.info(f"已回复过，跳过: {msg}")
                         continue
 
                     # 调用大模型生成回复
@@ -89,11 +94,7 @@ def main():
                     if reply:
                         # 回复到消息来源的会话（哪里收到回复哪里）
                         wx_bot.send_message(target_chat, reply)
-                        replied_keys.add(msg_fingerprint)
-                        # 限制指纹集合大小
-                        if len(replied_keys) > 1000:
-                            for _ in range(200):
-                                replied_keys.pop()
+                        wx_bot.mark_replied(msg_fingerprint)
                         logger.info(f"已回复 [{target_chat}]: {reply[:80]}")
                     else:
                         logger.warning(f"大模型返回空回复: {msg}")

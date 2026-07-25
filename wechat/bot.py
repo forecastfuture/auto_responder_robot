@@ -12,12 +12,19 @@ pywechat 通过 pywinauto 自动化 Windows 微信客户端实现消息收发。
     - 获取会话列表
 """
 
+import json
 import logging
+import os
 import re
 import time
 from typing import List, Optional, Any
 
-logger = logging.getLogger(__name__)
+from utils.set_logger import get_logger
+
+logger = get_logger()
+
+# 持久化文件：已发送内容 + 已回复指纹，重启后仍能识别自身消息、不重复回复
+_PERSIST_FILE = os.path.join("data", "bot_dedup.json")
 
 
 class WeChatMessage:
@@ -89,6 +96,8 @@ class WeChatBot:
         self._my_name: str = ""  # 当前用户昵称，用于过滤自己发的消息
         self._sent_contents: set = set()  # 已发送消息内容集合，用于过滤自身消息
         self._sent_contents_ordered: list = []  # 保持插入顺序，用于淘汰旧记录
+        self._replied_keys: set = set()  # 已回复消息指纹，保证每条消息只回复一次
+        self._load_persist_store()  # 从磁盘恢复记录（重启后仍能识别自身消息）
 
     def init_wechat(self) -> bool:
         """
@@ -155,6 +164,55 @@ class WeChatBot:
         while len(self._sent_contents_ordered) > 200:
             old = self._sent_contents_ordered.pop(0)
             self._sent_contents.discard(old)
+        self._save_persist_store()
+
+    def _load_persist_store(self):
+        """从磁盘加载已发送内容和已回复指纹（跨重启保持去重能力）"""
+        try:
+            if os.path.exists(_PERSIST_FILE):
+                with open(_PERSIST_FILE, "r", encoding="utf-8") as f:
+                    store = json.load(f)
+                self._sent_contents_ordered = list(store.get("sent", []))
+                self._sent_contents = set(self._sent_contents_ordered)
+                self._replied_keys = set(store.get("replied", []))
+                logger.info(
+                    f"加载去重记录: 已发送 {len(self._sent_contents)} 条, "
+                    f"已回复 {len(self._replied_keys)} 条"
+                )
+        except Exception as e:
+            logger.warning(f"加载去重记录失败: {e}")
+
+    def _save_persist_store(self):
+        """持久化已发送内容和已回复指纹到磁盘"""
+        try:
+            os.makedirs(os.path.dirname(_PERSIST_FILE), exist_ok=True)
+            store = {
+                "sent": self._sent_contents_ordered[-200:],
+                "replied": list(self._replied_keys)[-1000:],
+            }
+            with open(_PERSIST_FILE, "w", encoding="utf-8") as f:
+                json.dump(store, f, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"保存去重记录失败: {e}")
+
+    def is_self_content(self, content: str) -> bool:
+        """判断消息内容是否与机器人已发送的内容一致（规范化比较）"""
+        content_norm = self._normalize(content)
+        if not content_norm:
+            return False
+        return any(self._normalize(s) == content_norm for s in self._sent_contents)
+
+    def is_replied(self, fingerprint: str) -> bool:
+        """检查消息指纹是否已回复过"""
+        return fingerprint in self._replied_keys
+
+    def mark_replied(self, fingerprint: str):
+        """记录已回复的消息指纹并持久化"""
+        self._replied_keys.add(fingerprint)
+        if len(self._replied_keys) > 1000:
+            for _ in range(200):
+                self._replied_keys.pop()
+        self._save_persist_store()
 
     @staticmethod
     def _normalize(text: str) -> str:
@@ -227,22 +285,25 @@ class WeChatBot:
             if self._normalize(sent) == content_norm:
                 return True
 
-        # 群聊格式: "发送人: 消息内容"，去掉发送人前缀后再匹配
-        if ": " in content:
-            prefix, body = content.split(": ", 1)
+        # 群聊格式: "发送人: 消息内容" 或 "发送人：消息内容"（兼容半角/全角冒号）
+        sep = ": " if ": " in content else ("：" if "：" in content else None)
+        if sep:
+            prefix, body = content.split(sep, 1)
             body_norm = self._normalize(body)
             if body_norm:
                 for sent in self._sent_contents:
                     if self._normalize(sent) == body_norm:
-                        # 进一步确认前缀是自己（避免误伤别人发的相同内容）
+                        # 前缀是自己或 "你" → 确认是自身消息
                         if self._my_name and (
                             prefix.strip() == self._my_name.strip()
                             or self._my_name.strip() in prefix.strip()
                         ):
                             return True
-                        # 前缀为 "你" 即认为自己的
                         if prefix.strip() == "你":
                             return True
+                        # 无法确认前缀（昵称获取失败等），但内容精确命中已发送记录，
+                        # 仍视为自身消息（宁可漏处理一条，不可自我回复死循环）
+                        return True
 
         return False
 
@@ -380,7 +441,7 @@ class WeChatBot:
             snapshot_content_map = {}
             for s in sessions:
                 if s and s[0]:
-                    snapshot_content_map[s[0]] = s[2] if len(s) > 2 else ""
+                    snapshot_content_map[str(s[0]).strip()] = s[2] if len(s) > 2 else ""
 
             filtered_sessions = []
             for friend in changed_sessions:
