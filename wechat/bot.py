@@ -77,7 +77,11 @@ class WeChatBot:
             listen_groups: 要监听的群名列表，None 表示监听所有
         """
         self._initialized = False
-        self.listen_groups = listen_groups
+        # 监听白名单（去除首尾空格，确保与回复目标一致）
+        self.listen_groups = (
+            [g.strip() for g in listen_groups if g and g.strip()]
+            if listen_groups else None
+        )
         self._seen_messages: set = set()  # 已处理消息去重
         self._session_snapshot: dict = {}  # 会话快照: {friend: "timestamp|last_content"}
         self._first_scan: bool = True  # 首次扫描标志，仅建立基线不拉消息
@@ -234,7 +238,7 @@ class WeChatBot:
         发送消息到群（或好友）
 
         Args:
-            group_name: 群名或好友备注
+            group_name: 群名或好友备注（必须与微信会话列表显示名称一致）
             message: 消息内容
 
         Returns:
@@ -244,20 +248,30 @@ class WeChatBot:
             logger.error("微信未初始化，无法发送消息")
             return False
 
+        target = group_name.strip()
+        if not target:
+            logger.error("发送目标为空，拒绝发送")
+            return False
+
+        # 安全校验：如果配置了监听白名单，只允许向白名单内的会话发送
+        if self.listen_groups and target not in self.listen_groups:
+            logger.warning(f"目标会话 '{target}' 不在监听白名单内，拒绝发送")
+            return False
+
         try:
             from pyweixin import Messages
 
             Messages.send_messages_to_friend(
-                friend=group_name,
+                friend=target,
                 messages=[message],
                 close_weixin=False,
             )
             # 记录已发送内容，防止下次轮询把自己的回复当成新消息
             self._record_sent_message(message)
-            logger.info(f"消息已发送到 '{group_name}': {message[:50]}...")
+            logger.info(f"消息已发送到 '{target}': {message[:50]}...")
             return True
         except Exception as e:
-            logger.error(f"发送消息到 '{group_name}' 失败: {e}")
+            logger.error(f"发送消息到 '{target}' 失败: {e}")
             return False
 
     def send_message(self, who: str, message: str) -> bool:
@@ -322,12 +336,14 @@ class WeChatBot:
             for s in sessions:
                 if not s or not s[0]:
                     continue
-                friend = s[0]
+                friend = str(s[0]).strip()
+                if not friend:
+                    continue
                 ts = s[1] if len(s) > 1 else ""
                 content = s[2] if len(s) > 2 else ""
                 current_sig = f"{ts}|{content}"
 
-                # 群过滤：只处理目标群
+                # 白名单过滤：只处理目标会话，其他会话一律不拉取不回复
                 if self.listen_groups and friend not in self.listen_groups:
                     continue
 

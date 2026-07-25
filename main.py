@@ -28,8 +28,16 @@ POLL_INTERVAL = settings.POLL_INTERVAL
 def main():
     """主函数：初始化微信 + 大模型，轮询消息并自动回复"""
 
+    # --- 加载回复白名单：只监听指定会话，收到的消息回复到原会话 ---
+    reply_chats = list(settings.get("REPLY_CHATS") or [])
+    reply_chats = [str(c).strip() for c in reply_chats if str(c).strip()]
+    if not reply_chats:
+        logger.error("未配置 REPLY_CHATS！请在 basic_config/settings.yaml 中指定要回复的会话名称。")
+        return
+    logger.info(f"只监听以下会话: {reply_chats}")
+
     # --- 初始化微信 ---
-    wx_bot = WeChatBot()
+    wx_bot = WeChatBot(listen_groups=reply_chats)
     if not wx_bot.init_wechat():
         logger.error("微信初始化失败！请确保微信 PC 客户端正在运行且已登录。")
         logger.error("  1. Windows 微信 PC 客户端正在运行")
@@ -44,6 +52,7 @@ def main():
 
     logger.info("=" * 50)
     logger.info("机器人已启动！正在监听微信消息...")
+    logger.info(f"监听会话: {reply_chats}")
     logger.info("按 Ctrl+C 停止运行")
     logger.info("=" * 50)
 
@@ -55,6 +64,12 @@ def main():
                 try:
                     logger.info(f"收到消息: {msg}")
 
+                    # 安全校验：只回复白名单内的会话，且回复目标必须是消息来源会话
+                    target_chat = msg.chat.strip()
+                    if target_chat not in reply_chats:
+                        logger.warning(f"非目标会话，跳过: [{target_chat}]")
+                        continue
+
                     # 调用大模型生成回复
                     reply = llm.chat_with_system(
                         system_prompt=system_prompt,
@@ -62,8 +77,9 @@ def main():
                     )
 
                     if reply:
-                        wx_bot.send_message(msg.chat, reply)
-                        logger.info(f"已回复 [{msg.chat}]: {reply[:80]}")
+                        # 回复到消息来源的会话（哪里收到回复哪里）
+                        wx_bot.send_message(target_chat, reply)
+                        logger.info(f"已回复 [{target_chat}]: {reply[:80]}")
                     else:
                         logger.warning(f"大模型返回空回复: {msg}")
 
