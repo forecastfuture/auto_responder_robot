@@ -12,8 +12,6 @@
 """
 
 import time
-import logging
-import re
 
 from llm.client import LLMClient
 from wechat.bot import WeChatBot
@@ -30,8 +28,7 @@ def main():
     """主函数：初始化微信 + 大模型，轮询消息并自动回复"""
 
     # --- 加载回复白名单：只监听指定会话，收到的消息回复到原会话 ---
-    reply_chats = list(settings.get("REPLY_CHATS") or [])
-    reply_chats = [str(c).strip() for c in reply_chats if str(c).strip()]
+    reply_chats = [str(c).strip() for c in (settings.get("REPLY_CHATS") or []) if str(c).strip()]
     if not reply_chats:
         logger.error("未配置 REPLY_CHATS！请在 basic_config/settings.yaml 中指定要回复的会话名称。")
         return
@@ -58,31 +55,17 @@ def main():
     logger.info("=" * 50)
 
     # --- 主循环：轮询消息 → 调用大模型 → 回复 ---
+    # get_messages() 已自动过滤自身消息和已回复消息，这里只需处理返回的新消息
     try:
         while True:
-            messages = wx_bot.get_messages()
-            for msg in messages:
+            for msg in wx_bot.get_messages():
                 try:
                     logger.info(f"收到消息: {msg}")
 
-                    # 安全校验：只回复白名单内的会话，且回复目标必须是消息来源会话
+                    # 安全校验：只回复白名单内的会话
                     target_chat = msg.chat.strip()
                     if target_chat not in reply_chats:
                         logger.warning(f"非目标会话，跳过: [{target_chat}]")
-                        continue
-
-                    # 防御一：消息内容命中机器人已发送记录 → 自身消息，绝不回复
-                    # （防止自我回复死循环；持久化存储，重启后依然有效）
-                    if wx_bot.is_self_content(msg.content):
-                        logger.info(f"自身消息，跳过: {msg}")
-                        continue
-
-                    # 防御二：消息指纹（持久化），同一条消息绝不重复回复
-                    fp_sender = re.sub(r"\s+", " ", msg.sender.strip())
-                    fp_content = re.sub(r"\s+", " ", msg.content.strip())
-                    msg_fingerprint = f"{fp_sender}|{fp_content}|{target_chat}"
-                    if wx_bot.is_replied(msg_fingerprint):
-                        logger.info(f"已回复过，跳过: {msg}")
                         continue
 
                     # 调用大模型生成回复
@@ -92,9 +75,7 @@ def main():
                     )
 
                     if reply:
-                        # 回复到消息来源的会话（哪里收到回复哪里）
                         wx_bot.send_message(target_chat, reply)
-                        wx_bot.mark_replied(msg_fingerprint)
                         logger.info(f"已回复 [{target_chat}]: {reply[:80]}")
                     else:
                         logger.warning(f"大模型返回空回复: {msg}")
