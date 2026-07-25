@@ -82,6 +82,8 @@ class WeChatBot:
         self._session_snapshot: dict = {}  # 会话快照: {friend: "timestamp|last_content"}
         self._first_scan: bool = True  # 首次扫描标志，仅建立基线不拉消息
         self._my_name: str = ""  # 当前用户昵称，用于过滤自己发的消息
+        self._sent_contents: set = set()  # 已发送消息内容集合，用于过滤自身消息
+        self._sent_contents_ordered: list = []  # 保持插入顺序，用于淘汰旧记录
 
     def init_wechat(self) -> bool:
         """
@@ -132,6 +134,101 @@ class WeChatBot:
             )
             return False
 
+    def _record_sent_message(self, message: str):
+        """
+        记录已发送的消息内容，用于后续过滤自身消息
+
+        Args:
+            message: 已发送的消息内容
+        """
+        content = message.strip()
+        if not content:
+            return
+        self._sent_contents.add(content)
+        self._sent_contents_ordered.append(content)
+        # 限制集合大小，淘汰最早的记录
+        while len(self._sent_contents_ordered) > 200:
+            old = self._sent_contents_ordered.pop(0)
+            self._sent_contents.discard(old)
+
+    def _is_self_message(self, sender: str, content: str) -> bool:
+        """
+        判断消息是否为自己发送的（多层防御）
+
+        判断策略:
+            1. 发送者名称匹配（昵称 / "你" / 包含关系）
+            2. 消息内容命中已发送记录（最可靠，不依赖名称）
+
+        Args:
+            sender: 消息发送者名称
+            content: 消息内容
+
+        Returns:
+            是否为自己发送的消息
+        """
+        # --- 策略1: 发送者名称匹配 ---
+        sender_stripped = sender.strip()
+        if sender_stripped:
+            # 微信 UI 中自己发的消息可能显示为 "你"
+            if sender_stripped == "你":
+                return True
+            if self._my_name:
+                my_name = self._my_name.strip()
+                # 精确匹配或包含匹配（群昵称可能是 "昵称-备注" 格式）
+                if sender_stripped == my_name or my_name in sender_stripped:
+                    return True
+
+        # --- 策略2: 内容命中已发送记录（不依赖名称，最可靠） ---
+        content_stripped = content.strip()
+        if content_stripped and content_stripped in self._sent_contents:
+            return True
+
+        return False
+
+    def _is_self_snapshot_content(self, last_content: str) -> bool:
+        """
+        判断会话列表中的最后一条消息内容是否为自己发送的
+
+        会话列表内容格式：
+            - 私聊: "消息内容"
+            - 群聊: "发送人: 消息内容"
+            - 可能带有 "[草稿]" 前缀
+
+        Args:
+            last_content: 会话列表中的最后一条消息内容
+
+        Returns:
+            是否为自己发送的消息
+        """
+        if not self._sent_contents:
+            return False
+
+        content = last_content.strip()
+        # 去掉 "[草稿]" 前缀
+        if content.startswith("[草稿]"):
+            content = content[len("[草稿]"):].strip()
+
+        # 直接匹配（私聊格式）
+        if content in self._sent_contents:
+            return True
+
+        # 群聊格式: "发送人: 消息内容"，去掉发送人前缀后再匹配
+        if ": " in content:
+            prefix, body = content.split(": ", 1)
+            body = body.strip()
+            if body and body in self._sent_contents:
+                # 进一步确认前缀是自己（避免误伤别人发的相同内容）
+                if self._my_name and (
+                    prefix.strip() == self._my_name.strip()
+                    or self._my_name.strip() in prefix.strip()
+                ):
+                    return True
+                # 前缀为 "你" 或无法确认时，仅当内容完全匹配已发送记录即认为自己的
+                if prefix.strip() == "你":
+                    return True
+
+        return False
+
     def send_group_message(self, group_name: str, message: str) -> bool:
         """
         发送消息到群（或好友）
@@ -155,6 +252,8 @@ class WeChatBot:
                 messages=[message],
                 close_weixin=False,
             )
+            # 记录已发送内容，防止下次轮询把自己的回复当成新消息
+            self._record_sent_message(message)
             logger.info(f"消息已发送到 '{group_name}': {message[:50]}...")
             return True
         except Exception as e:
@@ -247,12 +346,31 @@ class WeChatBot:
                 logger.debug("所有会话无新消息变化")
                 return []
 
-            logger.info(f"检测到 {len(changed_sessions)} 个会话有新消息: {changed_sessions}")
+            # 预过滤：如果会话最后一条消息是自己发的，跳过该会话
+            # （避免机器人回复后触发下一轮拉取，把自己的回复当新消息）
+            snapshot_content_map = {}
+            for s in sessions:
+                if s and s[0]:
+                    snapshot_content_map[s[0]] = s[2] if len(s) > 2 else ""
+
+            filtered_sessions = []
+            for friend in changed_sessions:
+                last_content = str(snapshot_content_map.get(friend, "")).strip()
+                if last_content and last_content in self._sent_contents:
+                    logger.debug(f"'{friend}' 最后一条是自己发的消息，跳过")
+                    continue
+                filtered_sessions.append(friend)
+
+            if not filtered_sessions:
+                logger.debug("变化的会话均为自身消息触发，无需处理")
+                return []
+
+            logger.info(f"检测到 {len(filtered_sessions)} 个会话有新消息: {filtered_sessions}")
 
             # 对有变化的会话拉取最近消息
             messages = []
             pull_count = 5  # 拉取最近5条消息，通过去重过滤已处理的
-            for friend in changed_sessions:
+            for friend in filtered_sessions:
                 try:
                     msg_list = Messages.pull_messages(
                         friend=friend,
@@ -270,8 +388,9 @@ class WeChatBot:
                         if not msg.content or not msg.content.strip():
                             continue
 
-                        # 跳过自己发的消息（只回复别人发的新消息）
-                        if self._my_name and msg.sender == self._my_name:
+                        # 跳过自己发的消息（多层防御：名称匹配 + 已发送内容匹配）
+                        if self._is_self_message(msg.sender, msg.content):
+                            logger.debug(f"跳过自身消息: {msg}")
                             continue
 
                         # 去重
