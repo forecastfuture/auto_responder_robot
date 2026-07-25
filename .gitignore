@@ -24,4 +24,13 @@ __pycache__
 
 test.py
 
-basic_config
+# 数据目录
+data/*.db
+data/*.log
+
+# 虚拟环境
+/venv/
+/venv*/
+
+# basic_config (含敏感信息，按需取消注释)
+#basic_config
