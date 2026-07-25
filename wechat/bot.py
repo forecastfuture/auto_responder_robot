@@ -12,7 +12,7 @@ pywechat 通过 pywinauto 自动化 Windows 微信客户端实现消息收发。
     - 获取会话列表
 """
 
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict
 
 from utils.set_logger import get_logger
 
@@ -35,6 +35,7 @@ class WeChatMessage:
         self.chat = chat
         self.msg_type = msg_type
         self.raw = raw
+        self.history: List[Dict[str, str]] = []  # 最近对话上下文（结构化多轮消息，从聊天窗口实时拉取）
 
     def __repr__(self):
         return (
@@ -71,9 +72,8 @@ class WeChatBot:
         self._seen_messages: set = set()  # 已处理消息去重（保证每条只回复一次）
         self._session_snapshot: dict = {}  # 会话快照: {friend: "timestamp|last_content"}
         self._first_scan: bool = True  # 首次扫描标志，仅建立基线不拉消息
-        self._my_name: str = ""  # 当前用户昵称，记录自己是谁
-        self._sent_contents: set = set()  # 已发送/回复消息内容集合
-        self._sent_contents_ordered: list = []  # 保持插入顺序，用于淘汰旧记录
+        self._my_name: str = ""  # 当前用户昵称，用于过滤自己发的消息
+        self._sent_contents: set = set()  # 已发送消息内容集合，用于过滤自身消息
 
     def init_wechat(self) -> bool:
         """初始化微信连接，验证客户端已运行并登录"""
@@ -109,16 +109,15 @@ class WeChatBot:
             return False
 
     def _is_self_message(self, sender: str, content: str) -> bool:
-        """判断消息是否为自己发送的（发送者名称匹配 + 已回复内容匹配）"""
+        """判断消息是否为自己发送的（发送者名称匹配 + 已发送内容匹配）"""
         s = sender.strip()
-        # 策略1: 发送者是自己
         if s == "你":
             return True
         if self._my_name:
             my = self._my_name.strip()
             if s == my or my in s:
                 return True
-        # 策略2: 内容命中已回复记录（规范化比较，容忍空白差异）
+        # 内容命中已发送记录（规范化比较，容忍空白差异）
         content_norm = " ".join(content.strip().split())
         if content_norm:
             for sent in self._sent_contents:
@@ -150,13 +149,7 @@ class WeChatBot:
                 close_weixin=False,
             )
             # 记录已发送内容，防止下次轮询把自己的回复当成新消息
-            content = message.strip()
-            self._sent_contents.add(content)
-            self._sent_contents_ordered.append(content)
-            # 限制集合大小，淘汰最早的记录
-            while len(self._sent_contents_ordered) > 200:
-                old = self._sent_contents_ordered.pop(0)
-                self._sent_contents.discard(old)
+            self._sent_contents.add(message.strip())
             logger.info(f"消息已发送到 '{target}': {message[:50]}...")
             return True
         except Exception as e:
@@ -223,7 +216,7 @@ class WeChatBot:
 
             logger.info(f"检测到 {len(changed_sessions)} 个会话有新消息: {changed_sessions}")
 
-            # 对有变化的会话拉取最近消息
+            # 对有变化的会话拉取最近5条消息，构建结构化对话上下文
             messages = []
             for friend in changed_sessions:
                 try:
@@ -234,25 +227,41 @@ class WeChatBot:
                     )
                     if not msg_list:
                         continue
+                    # 解析所有消息，构建结构化对话历史
+                    all_msgs = []
                     for msg_dict in msg_list:
                         msg = WeChatMessage.from_pyweixin(msg_dict, chat_name=friend)
                         if not msg.content.strip():
                             continue
-                        # 跳过自己发的消息
+                        all_msgs.append(msg)
+                    # 找出最后一条未处理的新消息（非自己发的）
+                    new_idx = -1
+                    for i, msg in enumerate(all_msgs):
                         if self._is_self_message(msg.sender, msg.content):
                             continue
-                        # 去重：保证每条消息只处理一次
                         msg_key = (
                             f"{' '.join(msg.sender.strip().split())}|"
                             f"{' '.join(msg.content.strip().split())}|"
                             f"{msg.chat.strip()}"
                         )
-                        if msg_key in self._seen_messages:
-                            continue
-                        self._seen_messages.add(msg_key)
-                        if len(self._seen_messages) > 1000:
+                        if msg_key not in self._seen_messages:
+                            self._seen_messages.add(msg_key)
+                            new_idx = i
+                    if len(self._seen_messages) > 1000:
+                        for _ in range(200):
                             self._seen_messages.pop()
-                        messages.append(msg)
+                    if new_idx >= 0:
+                        new_msg = all_msgs[new_idx]
+                        # 将新消息之前的所有消息构建为结构化对话历史
+                        # （从聊天窗口实时拉取，非本地记录）
+                        history = []
+                        for i in range(new_idx):
+                            msg = all_msgs[i]
+                            is_self = self._is_self_message(msg.sender, msg.content)
+                            role = "assistant" if is_self else "user"
+                            history.append({"role": role, "content": msg.content})
+                        new_msg.history = history
+                        messages.append(new_msg)
                 except Exception as e:
                     logger.error(f"拉取 '{friend}' 的消息失败: {e}")
 

@@ -68,10 +68,11 @@ def main():
                         logger.warning(f"非目标会话，跳过: [{target_chat}]")
                         continue
 
-                    # 调用大模型生成回复
+                    # 调用大模型生成回复（附带从聊天窗口实时拉取的最近5条对话作为历史上下文）
                     reply = llm.chat_with_system(
                         system_prompt=system_prompt,
                         user_message=f"{msg.sender}: {msg.content}",
+                        history=msg.history,
                     )
 
                     if reply:
