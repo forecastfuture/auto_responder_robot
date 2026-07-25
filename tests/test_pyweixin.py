@@ -6,13 +6,7 @@
 #   2. pip install pywechat127  # pip install pywechat127 --user --no-cache-dir 2>&1
 #   3. 微信窗口未被最小化到托盘
 
-import sys
-
-try:
-    from pyweixin import Tools, Messages, Navigator, GlobalConfig
-except ImportError:
-    print("未安装 pywechat，请运行: pip install pywechat127 --user --no-cache-dir")
-    sys.exit(1)
+from pyweixin import Tools, Messages, Navigator, GlobalConfig
 
 # 全局配置：不关闭微信主窗口
 GlobalConfig.close_weixin = False
@@ -21,18 +15,14 @@ GlobalConfig.is_maximize = False
 
 def test_login():
     """测试登录：通过 Tools.about_weixin() 获取微信基本信息，验证已连接并登录"""
-    print("=" * 50)
     print("【测试】微信登录连接")
-    print("=" * 50)
     try:
         info = Tools.about_weixin()
-        print("连接成功，微信信息：")
-        print(info)
+        print(f"\n\n------>连接成功，微信信息：{info}")
         print("✅ 登录测试通过\n")
         return True
     except Exception as e:
         print(f"❌ 登录测试失败: {e}")
-        print("请确保微信 PC 客户端已运行并登录")
         return False
 
 
@@ -41,7 +31,8 @@ def test_send_message():
     print("=" * 50)
     print("【测试】发送消息")
     print("=" * 50)
-    target = "文件传输助手"
+    # target = "文件传输助手"
+    target = "测试群"
     messages = ["你好，这是一条来自 pywechat 的测试消息", "测试完成 ✅"]
     try:
         Messages.send_messages_to_friend(friend=target, messages=messages)
