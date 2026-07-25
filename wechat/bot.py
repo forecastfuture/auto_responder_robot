@@ -79,6 +79,9 @@ class WeChatBot:
         self._initialized = False
         self.listen_groups = listen_groups
         self._seen_messages: set = set()  # 已处理消息去重
+        self._session_snapshot: dict = {}  # 会话快照: {friend: "timestamp|last_content"}
+        self._first_scan: bool = True  # 首次扫描标志，仅建立基线不拉消息
+        self._my_name: str = ""  # 当前用户昵称，用于过滤自己发的消息
 
     def init_wechat(self) -> bool:
         """
@@ -101,6 +104,17 @@ class WeChatBot:
             info = Tools.about_weixin()
             self._initialized = True
             logger.info(f"微信连接成功: {info}")
+
+            # 获取当前用户昵称，用于过滤自己发的消息
+            try:
+                from pyweixin import Contacts
+                my_info = Contacts.check_my_info(close_weixin=False)
+                self._my_name = my_info.get("昵称", "")
+                if self._my_name:
+                    logger.info(f"当前用户昵称: {self._my_name}")
+            except Exception as e:
+                logger.warning(f"获取用户昵称失败，将无法过滤自己发的消息: {e}")
+
             return True
         except ImportError:
             logger.error(
@@ -164,8 +178,14 @@ class WeChatBot:
         """
         获取新消息列表
 
-        通过 Messages.check_new_messages() 扫描会话列表中的新消息，
-        然后过滤出目标群的消息并进行去重。
+        通过会话列表快照对比检测新消息：
+        1. 使用 dump_sessions(chat_only=True) 获取当前有消息的会话列表
+        2. 对比上次快照，检测最后一条消息内容是否变化
+        3. 对有变化的会话调用 pull_messages 拉取最近消息
+        4. 去重后返回
+
+        相比 check_new_messages（依赖红色未读标记），快照对比方式更可靠，
+        不会因为机器人自身的 UI 操作清除了未读标记而漏检。
 
         注意: 该方法会进行 UI 自动化操作（打开微信窗口、扫描会话列表），
         调用频率不宜过高，建议间隔 10-15 秒。
@@ -179,41 +199,102 @@ class WeChatBot:
         try:
             from pyweixin import Messages
 
-            new_messages_raw = Messages.check_new_messages(close_weixin=False)
-            messages = []
+            # 获取当前会话列表（只有有消息的会话）
+            sessions = Messages.dump_sessions(chat_only=True, close_weixin=False)
+            if not sessions:
+                logger.debug("会话列表为空，无消息可检测")
+                return []
 
-            for friend, msg_list in new_messages_raw.items():
+            # 首次扫描：建立快照基线，不拉取消息（避免返回旧消息）
+            if self._first_scan:
+                for s in sessions:
+                    if not s or not s[0]:
+                        continue
+                    friend = s[0]
+                    ts = s[1] if len(s) > 1 else ""
+                    content = s[2] if len(s) > 2 else ""
+                    self._session_snapshot[friend] = f"{ts}|{content}"
+                self._first_scan = False
+                logger.info(f"首次扫描完成，建立 {len(self._session_snapshot)} 个会话基线")
+                return []
+
+            # 对比快照，检测有变化的会话
+            changed_sessions = []
+            for s in sessions:
+                if not s or not s[0]:
+                    continue
+                friend = s[0]
+                ts = s[1] if len(s) > 1 else ""
+                content = s[2] if len(s) > 2 else ""
+                current_sig = f"{ts}|{content}"
+
                 # 群过滤：只处理目标群
                 if self.listen_groups and friend not in self.listen_groups:
                     continue
 
-                for msg_dict in msg_list:
-                    msg = WeChatMessage.from_pyweixin(msg_dict, chat_name=friend)
+                prev_sig = self._session_snapshot.get(friend)
+                if prev_sig is None:
+                    # 新会话（之前快照中没有），视为有变化
+                    changed_sessions.append(friend)
+                elif current_sig != prev_sig:
+                    # 最后消息内容或时间变化，有新消息
+                    changed_sessions.append(friend)
 
-                    # 只处理文本消息（pyweixin 消息类型为中文）
-                    if msg.msg_type and msg.msg_type not in ("text", "文本", "Text"):
+                # 更新快照（无论是否变化都更新，保持最新状态）
+                self._session_snapshot[friend] = current_sig
+
+            if not changed_sessions:
+                logger.debug("所有会话无新消息变化")
+                return []
+
+            logger.info(f"检测到 {len(changed_sessions)} 个会话有新消息: {changed_sessions}")
+
+            # 对有变化的会话拉取最近消息
+            messages = []
+            pull_count = 5  # 拉取最近5条消息，通过去重过滤已处理的
+            for friend in changed_sessions:
+                try:
+                    msg_list = Messages.pull_messages(
+                        friend=friend,
+                        number=pull_count,
+                        close_weixin=False,
+                    )
+                    if not msg_list:
+                        logger.debug(f"'{friend}' 拉取到 0 条消息")
                         continue
 
-                    # 跳过空消息
-                    if not msg.content or not msg.content.strip():
-                        continue
+                    for msg_dict in msg_list:
+                        msg = WeChatMessage.from_pyweixin(msg_dict, chat_name=friend)
 
-                    # 去重
-                    msg_key = f"{msg.sender}|{msg.content}|{msg.chat}"
-                    if msg_key in self._seen_messages:
-                        continue
-                    self._seen_messages.add(msg_key)
+                        # 跳过空消息
+                        if not msg.content or not msg.content.strip():
+                            continue
 
-                    # 限制去重集合大小
-                    if len(self._seen_messages) > 500:
-                        self._seen_messages.clear()
+                        # 跳过自己发的消息（只回复别人发的新消息）
+                        if self._my_name and msg.sender == self._my_name:
+                            continue
+
+                        # 去重
+                        msg_key = f"{msg.sender}|{msg.content}|{msg.chat}"
+                        if msg_key in self._seen_messages:
+                            continue
                         self._seen_messages.add(msg_key)
 
-                    messages.append(msg)
+                        # 限制去重集合大小
+                        if len(self._seen_messages) > 500:
+                            self._seen_messages.clear()
+                            self._seen_messages.add(msg_key)
 
+                        messages.append(msg)
+                except Exception as e:
+                    logger.error(f"拉取 '{friend}' 的消息失败: {e}")
+
+            if messages:
+                logger.info(f"共获取 {len(messages)} 条新消息")
             return messages
+
         except Exception as e:
-            logger.error(f"获取消息失败: {e}")
+            logger.error(f"获取消息失败: {e}", exc_info=True)
             return []
 
     def get_all_chats(self) -> List[str]:
