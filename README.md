@@ -3,6 +3,9 @@
 ```bash
 pip install -r requirements.txt 
 ````
+# https://github.com/forecastfuture/auto_responder_robot.git
+
+# 微信下载：[]https://github.com/SiverKing/wechat4.0-windows-versions/releases/tag/v4.1.8.107
 
 # 使用版本
 # 微信自动化库: pywechat127 (pyweixin 模块)

@@ -8,7 +8,7 @@
 使用方式:
     1. 确保微信 PC 客户端已运行并登录
     2. 在 basic_config/settings.yaml 配置大模型 API 和 system_prompt
-    3. 运行: python main.py
+    3. 运行: python main.py  # test
 """
 
 import time
