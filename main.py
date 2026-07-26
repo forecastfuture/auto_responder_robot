@@ -57,9 +57,16 @@ def main():
 
     # --- 主循环：轮询消息 → 调用大模型 → 回复 ---
     # get_messages() 已自动过滤自身消息和已回复消息，这里只需处理返回的新消息
+    # 即使单轮失败也不退出，继续下一轮轮询
     try:
         while True:
-            for msg in wx_bot.get_messages():
+            try:
+                new_messages = wx_bot.get_messages()
+            except Exception as e:
+                logger.error(f"获取消息失败，跳过本轮: {e}", exc_info=True)
+                new_messages = []
+
+            for msg in new_messages:
                 try:
                     logger.info(f"收到消息: {msg}")
 
@@ -89,8 +96,6 @@ def main():
 
     except KeyboardInterrupt:
         logger.info("收到停止信号，正在关闭...")
-    except Exception as e:
-        logger.error(f"运行异常: {e}", exc_info=True)
     finally:
         logger.info("机器人已停止。")
 

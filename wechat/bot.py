@@ -12,6 +12,7 @@ pywechat 通过 pywinauto 自动化 Windows 微信客户端实现消息收发。
     - 获取会话列表
 """
 
+import time
 from typing import List, Optional, Any
 
 from utils.set_logger import get_logger
@@ -68,7 +69,7 @@ class WeChatBot:
             [g.strip() for g in listen_groups if g and g.strip()]
             if listen_groups else None
         )
-        self._seen_messages: set = set()  # 已处理消息去重（保证每条只回复一次）
+        self._seen_messages: dict = {}  # 已处理消息去重（保证每条只回复一次），dict 保持插入顺序便于 FIFO 淘汰
         self._session_snapshot: dict = {}  # 会话快照: {friend: "timestamp|last_content"}
         self._first_scan: bool = True  # 首次扫描标志，仅建立基线不拉消息
         self._my_name: str = ""  # 当前用户昵称，记录自己是谁
@@ -82,7 +83,9 @@ class WeChatBot:
 
             GlobalConfig.close_weixin = False
             GlobalConfig.is_maximize = False
-            GlobalConfig.search_pages = 0
+            # search_pages 设为非零值，优先在会话列表中按 automation_id 精确查找好友/群聊，
+            # 避免使用顶部搜索栏时搜索结果命中同名公众号/服务号（class_name 均为 mmui::SearchContentCellView）
+            GlobalConfig.search_pages = 5
 
             info = Tools.about_weixin()
             self._initialized = True
@@ -167,6 +170,26 @@ class WeChatBot:
         """发送消息（通用接口，群或好友均可）"""
         return self.send_group_message(who, message)
 
+    def _recover_to_session_view(self) -> None:
+        """恢复 UI 到会话列表视图
+
+        pull_messages 失败后 UI 可能停留在聊天窗口视图（而非会话列表），
+        导致后续 dump_sessions 找不到会话列表元素。
+        此方法显式点击侧边栏"微信"按钮，确保切回会话列表视图。
+        """
+        try:
+            from pyweixin import Navigator, GlobalConfig
+            from pyweixin.Uielements import SideBar
+
+            main_window = Navigator.open_weixin(is_maximize=GlobalConfig.is_maximize)
+            sidebar_btn = main_window.child_window(**SideBar.Weixin)
+            if sidebar_btn.exists(timeout=1):
+                sidebar_btn.click_input()
+                time.sleep(2)
+                logger.info("已恢复到会话列表视图")
+        except Exception as e:
+            logger.warning(f"恢复会话列表视图失败: {e}")
+
     def get_messages(self) -> List[WeChatMessage]:
         """
         获取新消息列表
@@ -181,9 +204,30 @@ class WeChatBot:
             return []
 
         try:
-            from pyweixin import Messages
+            from pyweixin import Messages, Navigator, GlobalConfig
+            from pyweixin.Uielements import SideBar, Main_window
 
-            sessions = Messages.dump_sessions(chat_only=True, close_weixin=False)
+            # dump_sessions 内部点击侧边栏后立即访问会话列表，
+            # 若 UI 未渲染完毕会抛 ElementNotFoundError，需重试
+            # 拉取消息失败后 UI 可能停留在聊天窗口视图，也需恢复
+            max_retries = 5
+            sessions = None
+            for attempt in range(max_retries):
+                try:
+                    sessions = Messages.dump_sessions(chat_only=True, close_weixin=False)
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"dump_sessions 第 {attempt + 1} 次失败，尝试恢复 UI 状态后重试: {e}"
+                        )
+                        # 显式点击侧边栏"微信"按钮，确保主界面处于会话列表视图
+                        self._recover_to_session_view()
+                    else:
+                        logger.error(f"dump_sessions 重试 {max_retries} 次后仍失败，跳过本轮: {e}")
+                        return []
+
+            # dump_sessions 全部重试失败
             if not sessions:
                 return []
 
@@ -249,12 +293,17 @@ class WeChatBot:
                         )
                         if msg_key in self._seen_messages:
                             continue
-                        self._seen_messages.add(msg_key)
-                        if len(self._seen_messages) > 1000:
-                            self._seen_messages.pop()
+                        self._seen_messages[msg_key] = True
+                        while len(self._seen_messages) > 1000:
+                            # FIFO 淘汰最旧的消息键
+                            oldest = next(iter(self._seen_messages))
+                            del self._seen_messages[oldest]
                         messages.append(msg)
                 except Exception as e:
                     logger.error(f"拉取 '{friend}' 的消息失败: {e}")
+                    # pull_messages 失败后 UI 可能停留在聊天窗口视图（如"只有系统消息"异常），
+                    # 必须恢复到会话列表视图，否则后续 dump_sessions 会失败
+                    self._recover_to_session_view()
 
             if messages:
                 logger.info(f"共获取 {len(messages)} 条新消息")
@@ -262,6 +311,8 @@ class WeChatBot:
 
         except Exception as e:
             logger.error(f"获取消息失败: {e}", exc_info=True)
+            # 兜底恢复 UI 状态
+            self._recover_to_session_view()
             return []
 
     def get_all_chats(self) -> List[str]:
