@@ -4,7 +4,7 @@ from dynaconf import Dynaconf
 
 # 加载主配置
 settings = Dynaconf(
-    settings_files=['basic_config/settings.yaml'],
+    settings_files=['basic_config/settings.yaml', 'basic_config/password.yaml'],
     load_dotenv=True,
     environments=False,
 )
