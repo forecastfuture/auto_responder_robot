@@ -1,11 +1,21 @@
-"""人设管理 - 从 persona.yaml 加载人设配置，构建系统提示词"""
+"""人设管理 - 从 persona.yaml 加载人设配置，构建系统提示词
+
+同时管理长期记忆的读写：长期记忆保存在 persona.yaml 的 "长期记忆" 键下。
+对话完成后实时更新该文件。
+"""
 
 import logging
+import os
 from typing import List, Optional
+
+import yaml
 
 from config import settings, persona_settings
 
 logger = logging.getLogger(__name__)
+
+PERSONA_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "basic_config", "persona.yaml")
 
 
 class Persona:
@@ -48,11 +58,74 @@ class Persona:
 
         logger.info(f"人设加载完成: name={self.name}, identity={self.identity}")
 
+    # ==================== 长期记忆（persona.yaml） ====================
+
+    @staticmethod
+    def get_long_term_memories() -> List[str]:
+        """读取 persona.yaml 中的长期记忆列表"""
+        try:
+            with open(PERSONA_FILE, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            memories = data.get("长期记忆", [])
+            if isinstance(memories, list):
+                return [str(m) for m in memories if str(m).strip()]
+            if isinstance(memories, str):
+                return [memories.strip()] if memories.strip() else []
+            return []
+        except Exception as e:
+            logger.error(f"读取长期记忆失败: {e}")
+            return []
+
+    @staticmethod
+    def add_long_term_memory(content: str) -> bool:
+        """
+        向 persona.yaml 添加一条长期记忆
+
+        实时写入文件，对话完成后即可持久化。
+
+        Args:
+            content: 记忆内容
+
+        Returns:
+            是否添加成功
+        """
+        content = content.strip()
+        if not content:
+            return False
+        try:
+            with open(PERSONA_FILE, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            memories = data.get("长期记忆", [])
+            if not isinstance(memories, list):
+                memories = [memories] if memories else []
+            # 去重：已存在则不重复添加
+            if content in memories:
+                logger.info(f"长期记忆已存在，跳过: {content[:50]}")
+                return True
+            memories.append(content)
+            data["长期记忆"] = memories
+            with open(PERSONA_FILE, "w", encoding="utf-8") as f:
+                yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+            logger.info(f"长期记忆已保存到 persona.yaml: {content[:50]}")
+            return True
+        except Exception as e:
+            logger.error(f"保存长期记忆失败: {e}")
+            return False
+
+    def build_long_term_memory_text(self) -> str:
+        """构建长期记忆提示文本"""
+        memories = self.get_long_term_memories()
+        if not memories:
+            return ""
+        return "## 长期记忆（生活习惯、爱好、重要信息）\n" + "\n".join(f"- {m}" for m in memories)
+
+    # ==================== 系统提示词构建 ====================
+
     def build_system_prompt(self) -> str:
         """
         构建完整的系统提示词
 
-        合并 settings.yaml 中的 system_prompt 和 persona.yaml 中的人设信息
+        合并 settings.yaml 中的 system_prompt 和 persona.yaml 中的人设信息及长期记忆
 
         Returns:
             完整的系统提示词
@@ -63,36 +136,15 @@ class Persona:
         if self.system_prompt:
             parts.append(self.system_prompt)
 
-        # 人设信息
-        parts.append(f"你的名字是{self.name}。")
-        parts.append(f"你的身份: {self.identity}。")
-        parts.append(f"你的年龄: {self.age}岁。")
+        # 长期记忆（来自 persona.yaml）
+        memory_text = self.build_long_term_memory_text()
+        if memory_text:
+            parts.append(memory_text)
 
-        # 聊天风格
-        if self.style:
-            parts.append(f"聊天风格: {'、'.join(self.style)}。")
-
-        # 知识领域
-        if self.knowledge:
-            parts.append(f"知识领域: {'、'.join(self.knowledge)}。")
-
-        # 规则
-        if self.rules:
-            parts.append(f"规则: {'、'.join(self.rules)}。")
-
-        return "\n".join(parts)
+        return "\n\n".join(parts)
 
     def should_listen_group(self, group_name: str) -> bool:
-        """
-        判断是否需要监听某个群
-
-        Args:
-            group_name: 群名
-
-        Returns:
-            如果配置了 groups 列表且为空，则监听所有群；
-            否则只监听配置列表中的群
-        """
+        """判断是否需要监听某个群"""
         if not self.groups:
             return True
         return group_name in self.groups

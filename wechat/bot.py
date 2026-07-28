@@ -10,6 +10,7 @@ pywechat 通过 pywinauto 自动化 Windows 微信客户端实现消息收发。
     - 发送消息到群/好友
     - 监听群消息（通过轮询会话列表新消息）
     - 获取会话列表
+    - 拉取指定会话最近N条消息（含图片）
 """
 
 from typing import List, Optional, Any
@@ -17,6 +18,9 @@ from typing import List, Optional, Any
 from utils.set_logger import get_logger
 
 logger = get_logger()
+
+# 图片消息类型关键词
+_IMAGE_TYPES = {"图片", "image", "[图片]", "[image]"}
 
 
 class WeChatMessage:
@@ -28,12 +32,14 @@ class WeChatMessage:
         content: str = "",
         chat: str = "",
         msg_type: str = "text",
+        image_path: str = "",
         raw: Any = None,
     ):
         self.sender = sender
         self.content = content
         self.chat = chat
         self.msg_type = msg_type
+        self.image_path = image_path  # 图片消息的本地路径（如有）
         self.raw = raw
 
     def __repr__(self):
@@ -42,13 +48,34 @@ class WeChatMessage:
             f"content='{self.content[:30]}...')"
         )
 
+    @property
+    def is_image(self) -> bool:
+        """是否为图片消息"""
+        return self.msg_type in _IMAGE_TYPES or bool(self.image_path)
+
     @classmethod
     def from_pyweixin(cls, msg_dict: dict, chat_name: str = "") -> "WeChatMessage":
         """从 pyweixin 消息字典转换为 WeChatMessage"""
         sender = str(msg_dict.get("消息发送人", "") or "")
         content = str(msg_dict.get("消息内容", "") or "")
         msg_type = str(msg_dict.get("消息类型", "text") or "text")
-        return cls(sender=sender, content=content, chat=chat_name, msg_type=msg_type, raw=msg_dict)
+        # 尝试获取图片路径（pyweixin 可能在不同字段中返回图片路径）
+        image_path = (
+            str(msg_dict.get("图片路径", "") or "")
+            or str(msg_dict.get("image_path", "") or "")
+            or str(msg_dict.get("文件路径", "") or "")
+        )
+        # 如果消息类型是图片但内容为空，给个占位符
+        if msg_type in _IMAGE_TYPES and not content:
+            content = "[图片]"
+        return cls(
+            sender=sender,
+            content=content,
+            chat=chat_name,
+            msg_type=msg_type,
+            image_path=image_path,
+            raw=msg_dict,
+        )
 
 
 class WeChatBot:
@@ -59,21 +86,17 @@ class WeChatBot:
     """
 
     def __init__(self, listen_groups: Optional[List[str]] = None):
-        """
-        Args:
-            listen_groups: 要监听的群名列表，None 表示监听所有
-        """
         self._initialized = False
         self.listen_groups = (
             [g.strip() for g in listen_groups if g and g.strip()]
             if listen_groups else None
         )
-        self._seen_messages: set = set()  # 已处理消息去重（保证每条只回复一次）
-        self._session_snapshot: dict = {}  # 会话快照: {friend: "timestamp|last_content"}
-        self._first_scan: bool = True  # 首次扫描标志，仅建立基线不拉消息
-        self._my_name: str = ""  # 当前用户昵称，记录自己是谁
-        self._sent_contents: set = set()  # 已发送/回复消息内容集合
-        self._sent_contents_ordered: list = []  # 保持插入顺序，用于淘汰旧记录
+        self._seen_messages: set = set()
+        self._session_snapshot: dict = {}
+        self._first_scan: bool = True
+        self._my_name: str = ""
+        self._sent_contents: set = set()
+        self._sent_contents_ordered: list = []
 
     def init_wechat(self) -> bool:
         """初始化微信连接，验证客户端已运行并登录"""
@@ -111,14 +134,12 @@ class WeChatBot:
     def _is_self_message(self, sender: str, content: str) -> bool:
         """判断消息是否为自己发送的（发送者名称匹配 + 已回复内容匹配）"""
         s = sender.strip()
-        # 策略1: 发送者是自己
         if s == "你":
             return True
         if self._my_name:
             my = self._my_name.strip()
             if s == my or my in s:
                 return True
-        # 策略2: 内容命中已回复记录（规范化比较，容忍空白差异）
         content_norm = " ".join(content.strip().split())
         if content_norm:
             for sent in self._sent_contents:
@@ -145,15 +166,11 @@ class WeChatBot:
             from pyweixin import Messages
 
             Messages.send_messages_to_friend(
-                friend=target,
-                messages=[message],
-                close_weixin=False,
+                friend=target, messages=[message], close_weixin=False,
             )
-            # 记录已发送内容，防止下次轮询把自己的回复当成新消息
             content = message.strip()
             self._sent_contents.add(content)
             self._sent_contents_ordered.append(content)
-            # 限制集合大小，淘汰最早的记录
             while len(self._sent_contents_ordered) > 200:
                 old = self._sent_contents_ordered.pop(0)
                 self._sent_contents.discard(old)
@@ -166,6 +183,55 @@ class WeChatBot:
     def send_message(self, who: str, message: str) -> bool:
         """发送消息（通用接口，群或好友均可）"""
         return self.send_group_message(who, message)
+
+    def get_recent_messages(self, chat_name: str, count: int = 5) -> List[WeChatMessage]:
+        """
+        拉取指定会话最近的 N 条消息（含图片）
+
+        Args:
+            chat_name: 会话名称（群名或好友名）
+            count: 拉取条数
+
+        Returns:
+            WeChatMessage 列表，按时间正序排列（最旧的在前）
+        """
+        if not self._initialized:
+            return []
+        try:
+            from pyweixin import Messages
+
+            msg_list = Messages.pull_messages(
+                friend=chat_name, number=count, close_weixin=False,
+            )
+            if not msg_list:
+                return []
+            # pull_messages 返回最新在前，反转为正序
+            msgs = [WeChatMessage.from_pyweixin(m, chat_name) for m in reversed(msg_list)]
+            logger.info(f"从 '{chat_name}' 拉取到 {len(msgs)} 条消息")
+            for m in msgs:
+                kind = "图片" if m.is_image else "文本"
+                logger.debug(f"  [{kind}] {m.sender}: {m.content[:50]}")
+            return msgs
+        except Exception as e:
+            logger.error(f"拉取 '{chat_name}' 最近消息失败: {e}")
+            return []
+
+    def get_last_message(self, chat_name: str) -> Optional[WeChatMessage]:
+        """
+        获取指定会话最后一条他人消息（用于测试）
+
+        Args:
+            chat_name: 会话名称
+
+        Returns:
+            最后一条非自己发的消息，没有则返回 None
+        """
+        msgs = self.get_recent_messages(chat_name, count=5)
+        for m in reversed(msgs):
+            if self._is_self_message(m.sender, m.content):
+                continue
+            return m
+        return None
 
     def get_messages(self) -> List[WeChatMessage]:
         """
@@ -187,7 +253,6 @@ class WeChatBot:
             if not sessions:
                 return []
 
-            # 首次扫描：建立快照基线，不拉取消息
             if self._first_scan:
                 for s in sessions:
                     if s and s[0]:
@@ -199,7 +264,6 @@ class WeChatBot:
                 logger.info(f"首次扫描完成，建立 {len(self._session_snapshot)} 个会话基线")
                 return []
 
-            # 对比快照，检测有变化的会话
             changed_sessions = []
             for s in sessions:
                 if not s or not s[0]:
@@ -207,7 +271,6 @@ class WeChatBot:
                 friend = str(s[0]).strip()
                 if not friend:
                     continue
-                # 白名单过滤
                 if self.listen_groups and friend not in self.listen_groups:
                     continue
                 ts = s[1] if len(s) > 1 else ""
@@ -223,25 +286,21 @@ class WeChatBot:
 
             logger.info(f"检测到 {len(changed_sessions)} 个会话有新消息: {changed_sessions}")
 
-            # 对有变化的会话拉取最近消息
             messages = []
             for friend in changed_sessions:
                 try:
                     msg_list = Messages.pull_messages(
-                        friend=friend,
-                        number=5,
-                        close_weixin=False,
+                        friend=friend, number=5, close_weixin=False,
                     )
                     if not msg_list:
                         continue
                     for msg_dict in msg_list:
                         msg = WeChatMessage.from_pyweixin(msg_dict, chat_name=friend)
-                        if not msg.content.strip():
+                        # 跳过空文本且非图片的消息
+                        if not msg.content.strip() and not msg.is_image:
                             continue
-                        # 跳过自己发的消息
                         if self._is_self_message(msg.sender, msg.content):
                             continue
-                        # 去重：保证每条消息只处理一次
                         msg_key = (
                             f"{' '.join(msg.sender.strip().split())}|"
                             f"{' '.join(msg.content.strip().split())}|"
@@ -270,6 +329,7 @@ class WeChatBot:
             return []
         try:
             from pyweixin import Messages
+
             sessions = Messages.dump_sessions(close_weixin=False)
             if sessions:
                 return [s[0] for s in sessions if s and s[0]]
