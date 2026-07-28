@@ -18,6 +18,7 @@ pip install -r requirements.txt
 # pip install wxauto4 # Name: wxauto4   # Version: 41.1.2 (已弃用，改用 pywechat127)
 # 微信版本 weixin_4.1.8.107
 
+# 不能拷贝之前的消息然后回复消息，使用测试群最后一条消息当最新接收的消息做信息的拷贝和回复测试，代码调整，尽量简化代码
 
 # WeChatFerry, weilink， 不要垃圾
 
