@@ -103,7 +103,7 @@ def main():
     logger.info("=" * 50)
     logger.info("机器人已启动！正在监听微信消息...")
     logger.info(f"监听会话: {reply_chats}")
-    logger.info(f"当前模型: {llm.model_name}（多模态: 支持图片识别）")
+    logger.info(f"文本模型: {llm.model_name} | 多模态模型: {llm.img_model_name}")
     logger.info("按 Ctrl+C 停止运行")
     logger.info("=" * 50)
 
@@ -125,9 +125,13 @@ def main():
                     # 功能1: 实时时间
                     time_prompt = build_time_prompt()
 
-                    # 功能2: 拉取最近5条消息作为上下文
-                    recent_msgs = wx_bot.get_recent_messages(target_chat, count=5)
+                    # 功能2: 使用 get_messages() 已缓存的最近5条消息作为上下文
+                    # 避免重复调用 pull_messages（UI自动化很慢且可能导致窗口状态异常）
+                    recent_msgs = wx_bot.get_cached_recent_messages(target_chat)
                     context_prompt = build_context_prompt(recent_msgs, msg)
+                    if recent_msgs:
+                        logger.info(f"上下文消息({len(recent_msgs)}条): "
+                                    + " | ".join(f"{m.sender}:{m.content[:20]}" for m in recent_msgs))
 
                     # 功能3: 历史对话记忆
                     memory_prompt = build_memory_prompt(memory_mgr, target_chat)
@@ -143,21 +147,33 @@ def main():
                     # 当前消息如果是图片也加入
                     if msg.is_image and msg.image_path:
                         image_paths.append(msg.image_path)
+                    # 去重（同一条消息可能同时在 recent_msgs 和 msg 中）
+                    image_paths = list(dict.fromkeys(image_paths))
+
+                    if image_paths:
+                        logger.info(f"检测到图片消息，共 {len(image_paths)} 张图片，使用多模态调用")
 
                     # 调用大模型生成回复（功能0: 完整提示词已在 LLMClient 内写入日志）
                     if image_paths:
+                        # 多模态调用：附上图片让 LLM 识别内容
+                        user_text = f"{msg.sender} 发送了图片，请识别图片内容并自然回复"
                         reply = llm.chat_multimodal(
                             system_prompt=full_system_prompt,
-                            user_text=f"{msg.sender}: {msg.content}",
+                            user_text=user_text,
                             image_paths=image_paths,
                             history=None,
                             temperature=persona.temperature,
                             max_tokens=persona.max_tokens,
                         )
                     else:
+                        # 纯文本调用
+                        user_msg = f"{msg.sender}: {msg.content}"
+                        # 如果是图片消息但未能保存图片，告知 LLM
+                        if msg.is_image:
+                            user_msg = f"{msg.sender} 发送了一张图片，但无法获取图片内容"
                         reply = llm.chat_with_system(
                             system_prompt=full_system_prompt,
-                            user_message=f"{msg.sender}: {msg.content}",
+                            user_message=user_msg,
                             temperature=persona.temperature,
                             max_tokens=persona.max_tokens,
                         )

@@ -13,6 +13,7 @@ pywechat 通过 pywinauto 自动化 Windows 微信客户端实现消息收发。
     - 拉取指定会话最近N条消息（含图片）
 """
 
+import os
 from typing import List, Optional, Any
 
 from utils.set_logger import get_logger
@@ -21,6 +22,9 @@ logger = get_logger()
 
 # 图片消息类型关键词
 _IMAGE_TYPES = {"图片", "image", "[图片]", "[image]"}
+
+# 图片保存目录（data/images/）
+_IMAGE_SAVE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "images")
 
 
 class WeChatMessage:
@@ -97,6 +101,7 @@ class WeChatBot:
         self._my_name: str = ""
         self._sent_contents: set = set()
         self._sent_contents_ordered: list = []
+        self._recent_context: dict = {}  # {chat_name: [WeChatMessage, ...]} 缓存最近拉取的消息（按时间正序）
 
     def init_wechat(self) -> bool:
         """初始化微信连接，验证客户端已运行并登录"""
@@ -147,6 +152,87 @@ class WeChatBot:
                     return True
         return False
 
+    def _save_recent_images(self, friend: str, count: int) -> List[str]:
+        """
+        保存与指定会话最近的 N 张图片到本地
+
+        pyweixin 的 pull_messages 只返回消息文本，不含图片文件。
+        此方法调用 Messages.save_media 从聊天记录中保存图片截图。
+        保存的文件按 newest first 排序（index 0 = 最新图片）。
+
+        Args:
+            friend: 会话名称
+            count: 需要保存的图片数量
+
+        Returns:
+            保存的图片文件路径列表（newest first），失败返回空列表
+        """
+        if not self._initialized or count <= 0:
+            return []
+        try:
+            from pyweixin import Messages
+
+            os.makedirs(_IMAGE_SAVE_DIR, exist_ok=True)
+
+            # save_media 保存文件名格式: "与{friend}的聊天图片{num}.png" (num=1 是最新)
+            Messages.save_media(
+                friend=friend,
+                number=count,
+                target_folder=_IMAGE_SAVE_DIR,
+                close_weixin=False,
+            )
+
+            # 查找刚保存的图片文件
+            prefix = f"与{friend}的聊天图片"
+            saved_files = []
+            for i in range(1, count + 1):
+                path = os.path.join(_IMAGE_SAVE_DIR, f"{prefix}{i}.png")
+                if os.path.exists(path):
+                    saved_files.append(path)
+
+            # 清理旧图片（只保留本次保存的）
+            for f_name in os.listdir(_IMAGE_SAVE_DIR):
+                if f_name.startswith(prefix) and f_name.endswith(".png"):
+                    full_path = os.path.join(_IMAGE_SAVE_DIR, f_name)
+                    if full_path not in saved_files:
+                        try:
+                            os.remove(full_path)
+                        except Exception:
+                            pass
+
+            if saved_files:
+                logger.info(f"保存了 {len(saved_files)} 张图片: {saved_files}")
+            return saved_files
+        except Exception as e:
+            logger.error(f"保存图片失败: {e}")
+            return []
+
+    def _attach_image_paths(self, msgs: List[WeChatMessage], friend: str) -> None:
+        """
+        为图片消息关联本地图片文件路径
+
+        检测 msgs 中的图片消息，调用 save_media 保存最近图片，
+        然后将保存的文件路径按时间倒序映射到图片消息对象。
+
+        Args:
+            msgs: 按时间正序排列的消息列表（最旧的在前）
+            friend: 会话名称
+        """
+        image_msgs = [m for m in msgs if m.is_image]
+        if not image_msgs:
+            return
+        saved_paths = self._save_recent_images(friend, len(image_msgs))
+        if not saved_paths:
+            logger.warning(f"未能保存 '{friend}' 的图片，将回退到纯文本处理")
+            return
+        # saved_paths: newest first (index 0 = 最新)
+        # image_msgs: 按时间正序 (最后一个 = 最新)
+        # 反向遍历 image_msgs，从最新的开始匹配
+        for i, img_msg in enumerate(reversed(image_msgs)):
+            if i < len(saved_paths):
+                img_msg.image_path = saved_paths[i]
+                logger.info(f"图片消息已关联: {img_msg.sender} -> {saved_paths[i]}")
+
     def send_group_message(self, group_name: str, message: str) -> bool:
         """发送消息到群（或好友）"""
         if not self._initialized:
@@ -184,6 +270,21 @@ class WeChatBot:
         """发送消息（通用接口，群或好友均可）"""
         return self.send_group_message(who, message)
 
+    def get_cached_recent_messages(self, chat_name: str) -> List[WeChatMessage]:
+        """
+        获取上次 get_messages() 拉取的最近消息（避免重复调用 pull_messages）
+
+        get_messages() 内部已调用 pull_messages 拉取5条消息并缓存，
+        此方法直接返回缓存结果，不触发额外的 UI 自动化操作。
+
+        Args:
+            chat_name: 会话名称
+
+        Returns:
+            WeChatMessage 列表（按时间正序），没有缓存则返回空列表
+        """
+        return self._recent_context.get(chat_name, [])
+
     def get_recent_messages(self, chat_name: str, count: int = 5) -> List[WeChatMessage]:
         """
         拉取指定会话最近的 N 条消息（含图片）
@@ -207,6 +308,10 @@ class WeChatBot:
                 return []
             # pull_messages 返回最新在前，反转为正序
             msgs = [WeChatMessage.from_pyweixin(m, chat_name) for m in reversed(msg_list)]
+
+            # 检测图片消息，保存图片并关联本地路径
+            self._attach_image_paths(msgs, chat_name)
+
             logger.info(f"从 '{chat_name}' 拉取到 {len(msgs)} 条消息")
             for m in msgs:
                 kind = "图片" if m.is_image else "文本"
@@ -294,8 +399,20 @@ class WeChatBot:
                     )
                     if not msg_list:
                         continue
-                    for msg_dict in msg_list:
-                        msg = WeChatMessage.from_pyweixin(msg_dict, chat_name=friend)
+                    # 创建 WeChatMessage 列表（按时间正序），复用同一批对象
+                    msgs_chrono = [
+                        WeChatMessage.from_pyweixin(m, chat_name=friend)
+                        for m in reversed(msg_list)
+                    ]
+
+                    # 检测图片消息，保存图片并关联本地路径
+                    self._attach_image_paths(msgs_chrono, friend)
+
+                    # 缓存拉取的最近消息（按时间正序），供 main.py 作为上下文使用
+                    self._recent_context[friend] = list(msgs_chrono)
+
+                    # 从同一批对象中筛选新消息（按时间正序遍历）
+                    for msg in msgs_chrono:
                         # 跳过空文本且非图片的消息
                         if not msg.content.strip() and not msg.is_image:
                             continue

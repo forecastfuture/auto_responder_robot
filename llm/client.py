@@ -45,12 +45,26 @@ class LLMClient:
         base_url: Optional[str] = None,
         model_name: Optional[str] = None,
     ):
-        self.api_key = api_key or str(settings.llm_model_params.api_key)
-        self.base_url = base_url or str(settings.llm_model_params.base_url)
-        self.model_name = model_name or str(settings.llm_model_params.model_name)
+        # 兼容新旧配置：优先 text_llm_model_params，回退到旧 llm_model_params
+        text_cfg = settings.get("TEXT_LLM_MODEL_PARAMS") or settings.get("llm_model_params")
+        img_cfg = settings.get("IMG_LLM_MODEL_PARAMS") or text_cfg
+
+        self.api_key = api_key or str(text_cfg.api_key)
+        self.base_url = base_url or str(text_cfg.base_url)
+        self.model_name = model_name or str(text_cfg.model_name)
+        # 多模态使用的模型名（可能与文本模型不同）
+        self.img_model_name = str(img_cfg.model_name)
+        self.img_api_key = str(img_cfg.api_key)
+        self.img_base_url = str(img_cfg.base_url)
 
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
-        logger.info(f"LLM 客户端初始化完成: model={self.model_name}, base_url={self.base_url}")
+        # 多模态专用客户端（如果 base_url 或 api_key 不同）
+        if self.img_base_url != self.base_url or self.img_api_key != self.api_key:
+            self._img_client = OpenAI(api_key=self.img_api_key, base_url=self.img_base_url)
+        else:
+            self._img_client = self.client
+
+        logger.info(f"LLM 客户端初始化完成: text_model={self.model_name}, img_model={self.img_model_name}, base_url={self.base_url}")
 
     def chat(
         self,
@@ -73,6 +87,7 @@ class LLMClient:
         self._log_prompt(messages)
 
         try:
+            logger.info(f"文本模型调用: model={self.model_name}")
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
@@ -154,19 +169,47 @@ class LLMClient:
         # 构建多模态 user 消息
         if image_paths:
             content: List[Dict[str, Any]] = [{"type": "text", "text": user_text}]
+            valid_images = []
             for img_path in image_paths:
                 if os.path.exists(img_path):
                     content.append({
                         "type": "image_url",
                         "image_url": {"url": _encode_image(img_path)},
                     })
+                    valid_images.append(img_path)
                 else:
                     logger.warning(f"图片不存在，跳过: {img_path}")
+            if not valid_images:
+                # 没有有效图片，回退到纯文本
+                logger.warning("没有有效图片，回退到纯文本调用")
+                return self.chat_with_system(
+                    system_prompt=system_prompt,
+                    user_message=user_text,
+                    history=history,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
             messages.append({"role": "user", "content": content})
+
+            # 多模态调用使用 img_model_name 和 _img_client
+            self._log_prompt(messages)
+            try:
+                logger.info(f"多模态模型调用: model={self.img_model_name}")
+                response = self._img_client.chat.completions.create(
+                    model=self.img_model_name,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                content_resp = response.choices[0].message.content
+                logger.debug(f"LLM 多模态回复: {content_resp[:100]}...")
+                return content_resp.strip()
+            except Exception as e:
+                logger.error(f"LLM 多模态调用失败: {e}")
+                return ""
         else:
             messages.append({"role": "user", "content": user_text})
-
-        return self.chat(messages, temperature, max_tokens)
+            return self.chat(messages, temperature, max_tokens)
 
     def extract_memory(self, user_message: str, reply: str = "") -> str:
         """
