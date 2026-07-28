@@ -24,6 +24,7 @@ from llm.client import LLMClient
 from wechat.bot import WeChatBot
 from agent.persona import Persona
 from agent.memory import MemoryManager
+from tools.scheduler import TaskScheduler
 from utils.set_logger import get_logger
 from config import settings
 
@@ -73,6 +74,51 @@ def build_memory_prompt(memory_mgr: MemoryManager, chat_name: str) -> str:
     return "\n".join(lines)
 
 
+def setup_cron_tasks(scheduler: TaskScheduler, wx_bot: WeChatBot):
+    """从 settings.yaml 加载 CRON_TASKS 配置并注册定时任务
+
+    配置格式（settings.yaml 中）:
+        CRON_TASKS:
+          - '0 8 * * *': ['会话名称', '发送的消息']
+          - '30 12 * * *': ['另一个会话', '中午好']
+    cron 表达式为 5 段标准格式: 分 时 日 月 周
+    """
+    cron_tasks = settings.get("CRON_TASKS") or []
+    if not cron_tasks:
+        logger.info("未配置 CRON_TASKS，跳过定时任务初始化")
+        return
+
+    registered = 0
+    for i, task_entry in enumerate(cron_tasks):
+        try:
+            # task_entry 是单键字典: {'0 8 * * *': ['会话名', '消息内容']}
+            for cron_expr, params in task_entry.items():
+                if not params or len(params) < 2:
+                    logger.warning(f"CRON_TASKS 第{i}项参数不足，跳过: {task_entry}")
+                    continue
+                chat_name = str(params[0]).strip()
+                message = str(params[1]).strip()
+                if not chat_name or not message:
+                    logger.warning(f"CRON_TASKS 第{i}项会话名或消息为空，跳过")
+                    continue
+                task_id = f"cron_{i}_{cron_expr.replace(' ', '_')}"
+                scheduler.add_cron_task(
+                    wx_bot.send_message,
+                    cron_expr,
+                    task_id=task_id,
+                    who=chat_name,
+                    message=message,
+                )
+                logger.info(
+                    f"注册定时任务: {cron_expr} -> 会话[{chat_name}] 消息[{message[:20]}]"
+                )
+                registered += 1
+        except Exception as e:
+            logger.error(f"注册 CRON_TASKS 第{i}项失败: {e}", exc_info=True)
+
+    logger.info(f"共注册 {registered} 个定时任务")
+
+
 def main():
     """主函数：初始化微信 + 大模型，轮询消息并自动回复"""
 
@@ -99,6 +145,11 @@ def main():
 
     # --- 初始化记忆系统 ---
     memory_mgr = MemoryManager()
+
+    # --- 初始化定时任务调度器 ---
+    scheduler = TaskScheduler()
+    setup_cron_tasks(scheduler, wx_bot)
+    scheduler.start()
 
     logger.info("=" * 50)
     logger.info("机器人已启动！正在监听微信消息...")
@@ -207,6 +258,10 @@ def main():
     except Exception as e:
         logger.error(f"运行异常: {e}", exc_info=True)
     finally:
+        try:
+            scheduler.shutdown()
+        except Exception:
+            pass
         logger.info("机器人已停止。")
 
 

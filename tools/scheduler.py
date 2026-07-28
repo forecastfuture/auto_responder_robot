@@ -59,6 +59,53 @@ class TaskScheduler:
         logger.info(f"添加定时任务: id={task_id}, time={time_str}")
         return task_id
 
+    def add_cron_task(
+        self,
+        task_func: Callable,
+        cron_expr: str,
+        task_id: Optional[str] = None,
+        **kwargs,
+    ) -> str:
+        """
+        添加 cron 表达式定时任务
+
+        支持 5 段标准 cron: "分 时 日 月 周"，如 "0 8 * * *" 表示每天 08:00。
+        各字段均可使用数字或通配符 * / - , 等 cron 语法。
+
+        Args:
+            task_func: 任务函数
+            cron_expr: cron 表达式，如 "0 8 * * *"
+            task_id: 任务 ID，可选
+            **kwargs: 传给任务函数的额外参数
+
+        Returns:
+            任务 ID
+        """
+        parts = cron_expr.split()
+        if len(parts) != 5:
+            raise ValueError(f"cron 表达式格式错误（需5段: 分 时 日 月 周）: {cron_expr}")
+        minute, hour, day, month, day_of_week = parts
+
+        if task_id is None:
+            task_id = f"cron_task_{self._task_count}"
+            self._task_count += 1
+
+        self.scheduler.add_job(
+            task_func,
+            CronTrigger(
+                minute=minute,
+                hour=hour,
+                day=day,
+                month=month,
+                day_of_week=day_of_week,
+            ),
+            id=task_id,
+            kwargs=kwargs,
+            replace_existing=True,
+        )
+        logger.info(f"添加 cron 定时任务: id={task_id}, expr={cron_expr}")
+        return task_id
+
     def add_interval_task(
         self,
         task_func: Callable,
