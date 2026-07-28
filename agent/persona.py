@@ -11,8 +11,9 @@ from typing import List, Optional
 import yaml
 
 from config import settings, persona_settings
+from utils.set_logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 PERSONA_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "basic_config", "persona.yaml")

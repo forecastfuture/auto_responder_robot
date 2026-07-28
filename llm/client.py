@@ -16,8 +16,9 @@ from typing import List, Dict, Optional, Any, Union
 from openai import OpenAI
 
 from config import settings
+from utils.set_logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 # 消息内容类型：纯文本或多模态内容数组
 ContentPart = Union[str, List[Dict[str, Any]]]

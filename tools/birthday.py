@@ -11,7 +11,9 @@ import os
 from datetime import datetime
 from typing import List, Tuple, Optional
 
-logger = logging.getLogger(__name__)
+from utils.set_logger import get_logger
+
+logger = get_logger()
 
 
 class BirthdayManager:

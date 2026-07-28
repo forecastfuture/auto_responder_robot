@@ -13,7 +13,9 @@ from typing import Callable, Optional
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-logger = logging.getLogger(__name__)
+from utils.set_logger import get_logger
+
+logger = get_logger()
 
 
 class TaskScheduler:

@@ -11,7 +11,9 @@ import random
 import logging
 from typing import List, Optional
 
-logger = logging.getLogger(__name__)
+from utils.set_logger import get_logger
+
+logger = get_logger()
 
 
 class Planner:
