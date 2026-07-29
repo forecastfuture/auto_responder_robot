@@ -74,8 +74,108 @@ def build_memory_prompt(memory_mgr: MemoryManager, chat_name: str) -> str:
     return "\n".join(lines)
 
 
-def setup_cron_tasks(scheduler: TaskScheduler, wx_bot: WeChatBot):
+def build_cron_system_prompt(persona: Persona, chat_name: str, raw_message: str) -> str:
+    """构建定时任务的 LLM 系统提示词
+
+    根据原始消息内容智能识别场景（早安/午安/晚安等），
+    指导 LLM 生成自然、不重复的问候语，而非僵硬照搬原文。
+    """
+    base_prompt = persona.build_system_prompt()
+    time_prompt = build_time_prompt()
+
+    instruction = (
+        f"## 定时消息生成指令\n"
+        f"这是一条定时触发的消息，目标会话是「{chat_name}」。\n"
+        f"原始定时消息意图：{raw_message}\n\n"
+        f"请根据这个意图，用你自己的风格自然地表达，不要僵硬地照搬原文。\n"
+        f"每次生成的措辞要有变化，避免千篇一律。\n"
+    )
+
+    # 根据消息内容识别场景，附加不同指令
+    morning_kw = ["早安", "早上好", "早好", "早呀", "早"]
+    noon_kw = ["中午好", "午安"]
+    afternoon_kw = ["下午好", "午后好"]
+    evening_kw = ["晚上好", "晚安", "晚安好", "晚好"]
+
+    if any(kw in raw_message for kw in morning_kw):
+        instruction += (
+            "\n### 早安运势占卜\n"
+            "这是早安问候。在问候之后，请附带今日运势占卜，格式参考：\n"
+            "- 今日运势（用星级表示，如 ★★★☆☆）\n"
+            "- 幸运色\n"
+            "- 宜（1~2件适合做的事）\n"
+            "- 忌（1~2件不宜做的事）\n"
+            "- 一句简短运势提醒\n"
+            "运势内容每次随机生成，轻松有趣，像一只高冷小猫给主人的每日运势播报。\n"
+            "整体控制在5行以内。\n"
+        )
+    elif any(kw in raw_message for kw in noon_kw):
+        instruction += (
+            "\n这是午间问候。可以轻松地提醒午餐或午休，语气自然随意，2~3行即可。\n"
+        )
+    elif any(kw in raw_message for kw in afternoon_kw):
+        instruction += (
+            "\n这是下午问候。可以轻松活泼一些，关心下午的状态或提提神，2~3行即可。\n"
+        )
+    elif any(kw in raw_message for kw in evening_kw):
+        instruction += (
+            "\n这是晚间问候。可以温暖贴心一些，提醒今天辛苦了或该休息了，2~3行即可。\n"
+        )
+    else:
+        instruction += "\n请根据消息意图自然表达，2~3行即可。\n"
+
+    return "\n\n".join(p for p in [base_prompt, time_prompt, instruction] if p)
+
+
+def send_cron_message(
+    llm: LLMClient,
+    persona: Persona,
+    wx_bot: WeChatBot,
+    chat_name: str,
+    raw_message: str,
+):
+    """定时任务回调：先让 LLM 生成自然回复，再发送到微信
+
+    如果 LLM 调用失败，回退到发送原始消息，确保定时消息不会丢失。
+    """
+    try:
+        system_prompt = build_cron_system_prompt(persona, chat_name, raw_message)
+        user_text = (
+            f"请根据上述意图生成一条发送给「{chat_name}」的自然消息。"
+            "直接输出消息内容，不要任何解释或多余说明。"
+        )
+
+        reply = llm.chat_with_system(
+            system_prompt=system_prompt,
+            user_message=user_text,
+            temperature=max(persona.temperature, 0.9),  # 定时消息提高随机性，避免千篇一律
+            max_tokens=persona.max_tokens,
+        )
+
+        if reply:
+            wx_bot.send_message(chat_name, reply)
+            logger.info(f"定时任务LLM生成并已发送 [{chat_name}]: {reply[:80]}")
+        else:
+            logger.warning(f"LLM生成定时消息为空，回退到原始消息: {raw_message}")
+            wx_bot.send_message(chat_name, raw_message)
+    except Exception as e:
+        logger.error(f"定时任务LLM生成失败，回退到原始消息: {e}", exc_info=True)
+        try:
+            wx_bot.send_message(chat_name, raw_message)
+        except Exception:
+            logger.error(f"回退发送原始消息也失败: {chat_name}")
+
+
+def setup_cron_tasks(
+    scheduler: TaskScheduler,
+    wx_bot: WeChatBot,
+    llm: LLMClient,
+    persona: Persona,
+):
     """从 settings.yaml 加载 CRON_TASKS 配置并注册定时任务
+
+    定时消息不再直接发送硬编码文本，而是先经过 LLM 生成自然、
+    随机的问候语（早安附带运势占卜），再发送到目标会话。
 
     配置格式（settings.yaml 中）:
         CRON_TASKS:
@@ -103,14 +203,17 @@ def setup_cron_tasks(scheduler: TaskScheduler, wx_bot: WeChatBot):
                     continue
                 task_id = f"cron_{i}_{cron_expr.replace(' ', '_')}"
                 scheduler.add_cron_task(
-                    wx_bot.send_message,
+                    send_cron_message,
                     cron_expr,
                     task_id=task_id,
-                    who=chat_name,
-                    message=message,
+                    llm=llm,
+                    persona=persona,
+                    wx_bot=wx_bot,
+                    chat_name=chat_name,
+                    raw_message=message,
                 )
                 logger.info(
-                    f"注册定时任务: {cron_expr} -> 会话[{chat_name}] 消息[{message[:20]}]"
+                    f"注册定时任务(LLM增强): {cron_expr} -> 会话[{chat_name}] 意图[{message[:20]}]"
                 )
                 registered += 1
         except Exception as e:
@@ -148,7 +251,7 @@ def main():
 
     # --- 初始化定时任务调度器 ---
     scheduler = TaskScheduler()
-    setup_cron_tasks(scheduler, wx_bot)
+    setup_cron_tasks(scheduler, wx_bot, llm, persona)
     scheduler.start()
 
     logger.info("=" * 50)
