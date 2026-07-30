@@ -211,6 +211,85 @@ class LLMClient:
             messages.append({"role": "user", "content": user_text})
             return self.chat(messages, temperature, max_tokens)
 
+    def should_reply(
+        self,
+        role: str,
+        sender: str,
+        content: str,
+        mention_keywords: Optional[List[str]] = None,
+        context: str = "",
+    ) -> bool:
+        """
+        判断消息是否需要角色回复
+
+        两层判断：
+        1. 关键词匹配：消息中包含 @角色名 或预设触发关键词，直接返回 True
+        2. LLM 语义判断：调用大模型判断消息内容是否需要角色回应
+
+        Args:
+            role: 角色名称（如 'twenty'）
+            sender: 消息发送者
+            content: 消息内容
+            mention_keywords: 额外的触发关键词列表（来自 settings.yaml 配置）
+            context: 最近对话上下文文本（可选，辅助 LLM 判断）
+
+        Returns:
+            True 表示需要回复，False 表示不需要
+        """
+        # --- 第一层：关键词匹配 ---
+        text = content.strip()
+        text_lower = text.lower()
+        role_lower = role.strip().lower()
+
+        # @角色名 直接命中
+        if f"@{role_lower}" in text_lower:
+            logger.info(f"关键词命中(@角色名): @{role_lower}")
+            return True
+
+        # 预设触发关键词
+        if mention_keywords:
+            for kw in mention_keywords:
+                kw = kw.strip().lower()
+                if kw and kw in text_lower:
+                    logger.info(f"关键词命中: {kw}")
+                    return True
+
+        # --- 第二层：LLM 语义判断 ---
+        judge_prompt = (
+            f"你是消息意图判断助手。角色名是「{role}」（一只猫猫，家庭成员）\n"
+            f"判断以下群聊消息是否需要「{role}」回复。\n\n"
+            f"需要回复的情况：\n"
+            f"- 直接@了{role}或叫了{role}的名字/昵称\n"
+            f"- 提问、求助、寻求建议\n"
+            f"- 消息明确需要{role}参与或回应\n"
+            f"- 涉及到{role}本人的话题\n\n"
+            f"不需要回复的情况：\n"
+            f"- 普通闲聊、陈述、感叹，没有针对{role}\n"
+            f"- 家庭成员之间的对话，{role}不需要介入\n"
+            f"- 无意义的表情、嗯、哦等\n\n"
+        )
+        if context:
+            judge_prompt += f"最近对话上下文：\n{context}\n\n"
+        judge_prompt += (
+            f"发送者：{sender}\n"
+            f"消息内容：{content}\n\n"
+            f"请只回复一个字：'是' 或 '否'。"
+        )
+
+        try:
+            result = self.chat_with_system(
+                system_prompt="你是一个消息意图判断助手，只回复'是'或'否'。",
+                user_message=judge_prompt,
+                temperature=0.1,
+                max_tokens=5,
+            )
+            need_reply = result.strip().startswith("是")
+            logger.info(f"LLM回复判断: '{result.strip()}' -> need_reply={need_reply}")
+            return need_reply
+        except Exception as e:
+            logger.error(f"LLM回复判断失败，默认不回复: {e}")
+            return False
+
     def extract_memory(self, user_message: str, reply: str = "") -> str:
         """
         从对话中提取值得长期记忆的信息

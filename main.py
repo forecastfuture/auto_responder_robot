@@ -32,6 +32,14 @@ logger = get_logger()
 
 POLL_INTERVAL = settings.POLL_INTERVAL
 
+# 回复触发关键词（除 @角色名 外）
+ROLE = str(settings.get("ROLE") or "twenty")
+ROLE_MENTION_KEYWORDS = [
+    str(k).strip()
+    for k in (settings.get("ROLE_MENTION_KEYWORDS") or [])
+    if str(k).strip()
+]
+
 
 def build_time_prompt() -> str:
     """构建实时时间提示词（功能1）"""
@@ -273,15 +281,36 @@ def main():
                         logger.warning(f"非目标会话，跳过: [{target_chat}]")
                         continue
 
-                    # 保存用户消息到记忆数据库
+                    # 保存用户消息到记忆数据库（无论是否回复都保存）
                     memory_mgr.add_message(msg.sender, target_chat, msg.content, "user")
+
+                    # ===== 回复决策：只有@角色或需要角色回应时才回复 =====
+                    # 构建上下文文本用于辅助判断
+                    recent_msgs = wx_bot.get_cached_recent_messages(target_chat)
+                    context_for_judge = " | ".join(
+                        f"{m.sender}:{m.content[:20]}" for m in recent_msgs
+                    )
+
+                    need_reply = llm.should_reply(
+                        role=ROLE,
+                        sender=msg.sender,
+                        content=msg.content,
+                        mention_keywords=ROLE_MENTION_KEYWORDS,
+                        context=context_for_judge,
+                    )
+
+                    if not need_reply:
+                        logger.info(
+                            f"消息不需要回复，仅记录: [{target_chat}] {msg.sender}: {msg.content[:50]}"
+                        )
+                        continue
+
+                    logger.info(f"消息需要回复，开始生成回复: [{target_chat}] {msg.sender}: {msg.content[:50]}")
 
                     # 功能1: 实时时间
                     time_prompt = build_time_prompt()
 
-                    # 功能2: 使用 get_messages() 已缓存的最近5条消息作为上下文
-                    # 避免重复调用 pull_messages（UI自动化很慢且可能导致窗口状态异常）
-                    recent_msgs = wx_bot.get_cached_recent_messages(target_chat)
+                    # 功能2: 使用已缓存的最近5条消息作为上下文
                     context_prompt = build_context_prompt(recent_msgs, msg)
                     if recent_msgs:
                         logger.info(f"上下文消息({len(recent_msgs)}条): "
