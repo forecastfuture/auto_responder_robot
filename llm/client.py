@@ -320,12 +320,14 @@ class LLMClient:
                 temperature=0.1,
                 max_tokens=5,
             )
-            need_reply = result.strip().startswith("是")
-            logger.info(f"LLM回复判断: '{result.strip()}' -> need_reply={need_reply}")
+            # 宽松模式：只有 LLM 明确说"否"才不回复，空回复或异常时默认回复
+            answer = result.strip()
+            need_reply = not answer.startswith("否")
+            logger.info(f"LLM回复判断: '{answer}' -> need_reply={need_reply}")
             return need_reply
         except Exception as e:
-            logger.error(f"LLM回复判断失败，默认不回复: {e}")
-            return False
+            logger.error(f"LLM回复判断失败，宽松模式默认回复: {e}")
+            return True
 
     def extract_memory(self, user_message: str, reply: str = "") -> str:
         """

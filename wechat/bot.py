@@ -233,6 +233,58 @@ class WeChatBot:
                 img_msg.image_path = saved_paths[i]
                 logger.info(f"图片消息已关联: {img_msg.sender} -> {saved_paths[i]}")
 
+    def _pull_messages_safe(self, friend: str, number: int = 5) -> list:
+        """带重试的 pull_messages 封装
+
+        首次以 close_weixin=False 拉取消息；若失败（如遇到 UI 弹窗/多选菜单残留），
+        等待后以 close_weixin=True 重试以重置微信窗口状态。
+        """
+        import time as _time
+
+        from pyweixin import Messages
+
+        # 第一次尝试
+        try:
+            msg_list = Messages.pull_messages(
+                friend=friend, number=number, close_weixin=False,
+            )
+            return msg_list or []
+        except Exception as first_err:
+            err_desc = self._format_ui_error(first_err)
+            logger.warning(
+                f"拉取 '{friend}' 消息首次失败({err_desc})，1秒后重试(close_weixin=True)"
+            )
+
+        # 第二次尝试：close_weixin=True 关闭聊天窗口以清除残留弹窗/菜单
+        _time.sleep(1)
+        try:
+            msg_list = Messages.pull_messages(
+                friend=friend, number=number, close_weixin=True,
+            )
+            logger.info(f"重试拉取 '{friend}' 消息成功")
+            return msg_list or []
+        except Exception as second_err:
+            err_desc = self._format_ui_error(second_err)
+            logger.error(
+                f"重试拉取 '{friend}' 消息仍然失败({err_desc})，跳过该会话本轮消息"
+            )
+            return []
+
+    @staticmethod
+    def _format_ui_error(exc: Exception) -> str:
+        """格式化 pywinauto 异常，避免直接打印巨大的元素字典"""
+        exc_str = str(exc)
+        # pywinauto 异常常以 dict 形式输出，提取关键信息
+        if "'title':" in exc_str:
+            import re
+            title_match = re.search(r"'title':\s*'([^']*)'", exc_str)
+            ctrl_match = re.search(r"'control_type':\s*'([^']*)'", exc_str)
+            title = title_match.group(1) if title_match else "未知"
+            ctrl = ctrl_match.group(1) if ctrl_match else "未知"
+            return f"UI元素异常(title={title}, type={ctrl})"
+        # 截断过长的异常文本
+        return exc_str[:200] if len(exc_str) > 200 else exc_str
+
     def send_group_message(self, group_name: str, message: str) -> bool:
         """发送消息到群（或好友）"""
         if not self._initialized:
@@ -299,11 +351,7 @@ class WeChatBot:
         if not self._initialized:
             return []
         try:
-            from pyweixin import Messages
-
-            msg_list = Messages.pull_messages(
-                friend=chat_name, number=count, close_weixin=False,
-            )
+            msg_list = self._pull_messages_safe(chat_name, number=count)
             if not msg_list:
                 return []
             # pull_messages 返回最新在前，反转为正序
@@ -394,9 +442,7 @@ class WeChatBot:
             messages = []
             for friend in changed_sessions:
                 try:
-                    msg_list = Messages.pull_messages(
-                        friend=friend, number=5, close_weixin=False,
-                    )
+                    msg_list = self._pull_messages_safe(friend, number=5)
                     if not msg_list:
                         continue
                     # 创建 WeChatMessage 列表（按时间正序），复用同一批对象
@@ -434,7 +480,8 @@ class WeChatBot:
                     if last_new_msg:
                         messages.append(last_new_msg)
                 except Exception as e:
-                    logger.error(f"拉取 '{friend}' 的消息失败: {e}")
+                    err_desc = self._format_ui_error(e)
+                    logger.error(f"处理 '{friend}' 的消息失败: {err_desc}")
 
             if messages:
                 logger.info(f"共获取 {len(messages)} 条新消息")
