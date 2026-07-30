@@ -411,7 +411,9 @@ class WeChatBot:
                     # 缓存拉取的最近消息（按时间正序），供 main.py 作为上下文使用
                     self._recent_context[friend] = list(msgs_chrono)
 
-                    # 从同一批对象中筛选新消息（按时间正序遍历）
+                    # 筛选新消息：标记所有新消息为已见，但只返回最后一条新消息
+                    # 这样同一会话连续收到多条消息时，不会逐条回复，只回复最新的
+                    last_new_msg = None
                     for msg in msgs_chrono:
                         # 跳过空文本且非图片的消息
                         if not msg.content.strip() and not msg.is_image:
@@ -428,7 +430,9 @@ class WeChatBot:
                         self._seen_messages.add(msg_key)
                         if len(self._seen_messages) > 1000:
                             self._seen_messages.pop()
-                        messages.append(msg)
+                        last_new_msg = msg
+                    if last_new_msg:
+                        messages.append(last_new_msg)
                 except Exception as e:
                     logger.error(f"拉取 '{friend}' 的消息失败: {e}")
 
