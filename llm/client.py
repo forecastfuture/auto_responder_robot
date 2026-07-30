@@ -66,6 +66,15 @@ class LLMClient:
 
         logger.info(f"LLM 客户端初始化完成: text_model={self.model_name}, img_model={self.img_model_name}, base_url={self.base_url}")
 
+    # 末尾强制提醒，追加到 system 消息末尾以强化规则执行
+    _ENFORCEMENT_SUFFIX = (
+        "\n\n## 重要提醒\n"
+        "请严格遵守上述全部规则。回复必须简短（2行以内）、口语化、不使用括号动作描写、"
+        "不主动加称呼、不脱离twenty的猫猫身份。违反任何一条规则都是不允许的。"
+    )
+    # 只有包含此关键词的 system prompt 才追加强化提醒（避免污染工具类调用）
+    _ENFORCEMENT_TRIGGER = settings.ROLE
+
     def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -83,6 +92,9 @@ class LLMClient:
         Returns:
             模型回复文本
         """
+        # 强化 system 消息：在末尾追加强制提醒，提升规则遵循率
+        messages = self._enforce_system_prompt(messages)
+
         # 完整提示词写入日志（功能0）
         self._log_prompt(messages)
 
@@ -119,6 +131,23 @@ class LLMClient:
             lines.append(f"[{role}] {content}")
         full_prompt = "\n".join(lines)
         logger.info(f"===== 完整提示词 =====\n{full_prompt}\n=====================")
+
+    def _enforce_system_prompt(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """在 system 消息末尾追加强制执行提醒（仅对 persona 类提示词生效）"""
+        if not messages:
+            return messages
+        result = list(messages)
+        for i, m in enumerate(result):
+            if m.get("role") == "system":
+                content = m.get("content", "")
+                if (
+                    isinstance(content, str)
+                    and self._ENFORCEMENT_TRIGGER in content
+                    and self._ENFORCEMENT_SUFFIX.strip() not in content
+                ):
+                    result[i] = {**m, "content": content + self._ENFORCEMENT_SUFFIX}
+                break
+        return result
 
     def chat_with_system(
         self,
@@ -190,6 +219,9 @@ class LLMClient:
                     max_tokens=max_tokens,
                 )
             messages.append({"role": "user", "content": content})
+
+            # 强化 system 消息：在末尾追加强制提醒
+            messages = self._enforce_system_prompt(messages)
 
             # 多模态调用使用 img_model_name 和 _img_client
             self._log_prompt(messages)
