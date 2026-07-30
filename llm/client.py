@@ -278,6 +278,11 @@ class LLMClient:
             logger.info(f"关键词命中(@角色名): @{role_lower}")
             return True
 
+        # 角色名直接被提及（不带@前缀，如 "twenty 我爱你"）
+        if role_lower and role_lower in text_lower:
+            logger.info(f"关键词命中(角色名): {role_lower}")
+            return True
+
         # 预设触发关键词
         if mention_keywords:
             for kw in mention_keywords:
