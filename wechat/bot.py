@@ -14,6 +14,7 @@ pywechat 通过 pywinauto 自动化 Windows 微信客户端实现消息收发。
 """
 
 import os
+import time
 from typing import List, Optional, Any
 
 from utils.set_logger import get_logger
@@ -102,6 +103,7 @@ class WeChatBot:
         self._sent_contents: set = set()
         self._sent_contents_ordered: list = []
         self._recent_context: dict = {}  # {chat_name: [WeChatMessage, ...]} 缓存最近拉取的消息（按时间正序）
+        self._pull_fail_cooldown: dict = {}  # {chat_name: expiry_timestamp} 拉取失败冷却，期间跳过该会话
 
     def init_wechat(self) -> bool:
         """初始化微信连接，验证客户端已运行并登录"""
@@ -233,14 +235,22 @@ class WeChatBot:
                 img_msg.image_path = saved_paths[i]
                 logger.info(f"图片消息已关联: {img_msg.sender} -> {saved_paths[i]}")
 
+    @staticmethod
+    def _dismiss_ui_popups():
+        """尝试按Escape关闭微信中残留的UI弹窗/菜单（如'多选'菜单）"""
+        try:
+            from pywinauto.keyboard import send_keys
+            send_keys('{ESC}')
+            logger.info("已发送ESC键尝试关闭残留UI弹窗")
+        except Exception as e:
+            logger.debug(f"发送ESC键失败(可忽略): {e}")
+
     def _pull_messages_safe(self, friend: str, number: int = 5) -> list:
         """带重试的 pull_messages 封装
 
         首次以 close_weixin=False 拉取消息；若失败（如遇到 UI 弹窗/多选菜单残留），
-        等待后以 close_weixin=True 重试以重置微信窗口状态。
+        先按ESC关闭残留弹窗，再以 close_weixin=True 重试以重置微信窗口状态。
         """
-        import time as _time
-
         from pyweixin import Messages
 
         # 第一次尝试
@@ -252,11 +262,14 @@ class WeChatBot:
         except Exception as first_err:
             err_desc = self._format_ui_error(first_err)
             logger.warning(
-                f"拉取 '{friend}' 消息首次失败({err_desc})，1秒后重试(close_weixin=True)"
+                f"拉取 '{friend}' 消息首次失败({err_desc})，尝试ESC+重试"
             )
 
+        # 按ESC关闭残留的弹窗/菜单（如"多选"菜单）
+        self._dismiss_ui_popups()
+        time.sleep(0.5)
+
         # 第二次尝试：close_weixin=True 关闭聊天窗口以清除残留弹窗/菜单
-        _time.sleep(1)
         try:
             msg_list = Messages.pull_messages(
                 friend=friend, number=number, close_weixin=True,
@@ -418,6 +431,7 @@ class WeChatBot:
                 return []
 
             changed_sessions = []
+            now_ts = time.time()
             for s in sessions:
                 if not s or not s[0]:
                     continue
@@ -425,6 +439,11 @@ class WeChatBot:
                 if not friend:
                     continue
                 if self.listen_groups and friend not in self.listen_groups:
+                    continue
+                # 跳过冷却中的会话（拉取失败后60秒内不再重试）
+                cooldown = self._pull_fail_cooldown.get(friend)
+                if cooldown and now_ts < cooldown:
+                    logger.debug(f"会话 '{friend}' 在冷却中，跳过本轮")
                     continue
                 ts = s[1] if len(s) > 1 else ""
                 content = s[2] if len(s) > 2 else ""
@@ -444,6 +463,9 @@ class WeChatBot:
                 try:
                     msg_list = self._pull_messages_safe(friend, number=5)
                     if not msg_list:
+                        # 拉取失败，设置60秒冷却避免反复重试同一会话
+                        self._pull_fail_cooldown[friend] = time.time() + 60
+                        logger.info(f"会话 '{friend}' 进入60秒冷却期")
                         continue
                     # 创建 WeChatMessage 列表（按时间正序），复用同一批对象
                     msgs_chrono = [
@@ -482,6 +504,7 @@ class WeChatBot:
                 except Exception as e:
                     err_desc = self._format_ui_error(e)
                     logger.error(f"处理 '{friend}' 的消息失败: {err_desc}")
+                    self._pull_fail_cooldown[friend] = time.time() + 60
 
             if messages:
                 logger.info(f"共获取 {len(messages)} 条新消息")

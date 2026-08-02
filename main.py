@@ -161,8 +161,11 @@ def send_cron_message(
         )
 
         if reply:
-            wx_bot.send_message(chat_name, reply)
-            logger.info(f"定时任务LLM生成并已发送 [{chat_name}]: {reply[:80]}")
+            success = wx_bot.send_message(chat_name, reply)
+            if success:
+                logger.info(f"定时任务LLM生成并已发送 [{chat_name}]: {reply[:80]}")
+            else:
+                logger.error(f"定时任务LLM生成但发送失败 [{chat_name}]: {reply[:80]}")
         else:
             logger.warning(f"LLM生成定时消息为空，回退到原始消息: {raw_message}")
             wx_bot.send_message(chat_name, raw_message)
@@ -272,7 +275,14 @@ def main():
     # --- 主循环 ---
     try:
         while True:
-            for msg in wx_bot.get_messages():
+            # 每轮独立 try-except 保护，拉取异常不影响下一轮
+            try:
+                new_messages = wx_bot.get_messages()
+            except Exception as e:
+                logger.error(f"本轮消息拉取异常，跳过本轮: {e}", exc_info=True)
+                new_messages = []
+
+            for msg in new_messages:
                 try:
                     logger.info(f"收到消息: {msg}")
 
