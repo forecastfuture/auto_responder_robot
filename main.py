@@ -25,6 +25,7 @@ from wechat.bot import WeChatBot
 from agent.persona import Persona
 from agent.memory import MemoryManager
 from tools.scheduler import TaskScheduler
+from tools.weather import WeatherTool
 from utils.set_logger import get_logger
 from config import settings
 
@@ -39,6 +40,53 @@ ROLE_MENTION_KEYWORDS = [
     for k in (settings.get("ROLE_MENTION_KEYWORDS") or [])
     if str(k).strip()
 ]
+
+# LLM 可调用的工具 schema 列表
+LLM_TOOLS = [
+    WeatherTool.SCHEMA,
+    {
+        "type": "function",
+        "function": {
+            "name": "search_history",
+            "description": "搜索本地保存的历史对话记录。当用户想查之前的聊天内容时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {
+                        "type": "string",
+                        "description": "搜索关键词",
+                    },
+                    "chat_name": {
+                        "type": "string",
+                        "description": "会话名称（可选，不填则搜全部）",
+                    },
+                },
+                "required": ["keyword"],
+            },
+        },
+    },
+]
+
+
+def make_tool_executor(memory_mgr: MemoryManager):
+    """创建工具执行器，供 chat_with_tools 使用"""
+    def executor(tool_name: str, args: dict) -> str:
+        if tool_name == "get_weather":
+            return WeatherTool.get_weather(args.get("location", ""))
+        elif tool_name == "search_history":
+            results = memory_mgr.search_history(
+                keyword=args.get("keyword", ""),
+                chat_name=args.get("chat_name", ""),
+            )
+            if not results:
+                return "未找到匹配的历史记录。"
+            lines = []
+            for r in results[:10]:
+                lines.append(f"[{r['timestamp']}] {r['chat']} | {r['sender']}: {r['content'][:80]}")
+            return f"找到 {len(results)} 条记录:\n" + "\n".join(lines)
+        else:
+            return f"未知工具: {tool_name}"
+    return executor
 
 
 def build_time_prompt() -> str:
@@ -259,6 +307,7 @@ def main():
 
     # --- 初始化记忆系统 ---
     memory_mgr = MemoryManager()
+    tool_executor = make_tool_executor(memory_mgr)
 
     # --- 初始化定时任务调度器 ---
     scheduler = TaskScheduler()
@@ -359,14 +408,17 @@ def main():
                             max_tokens=persona.max_tokens,
                         )
                     else:
-                        # 纯文本调用
+                        # 纯文本调用（支持工具调用：天气查询、历史搜索）
                         user_msg = f"{msg.sender}: {msg.content}"
                         # 如果是图片消息但未能保存图片，告知 LLM
                         if msg.is_image:
                             user_msg = f"{msg.sender} 发送了一张图片，但无法获取图片内容"
-                        reply = llm.chat_with_system(
+                        reply = llm.chat_with_tools(
                             system_prompt=full_system_prompt,
                             user_message=user_msg,
+                            tools=LLM_TOOLS,
+                            tool_executor=tool_executor,
+                            history=None,
                             temperature=persona.temperature,
                             max_tokens=persona.max_tokens,
                         )

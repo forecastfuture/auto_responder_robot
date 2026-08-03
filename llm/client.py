@@ -168,6 +168,103 @@ class LLMClient:
         messages.append({"role": "user", "content": user_message})
         return self.chat(messages, temperature, max_tokens)
 
+    def chat_with_tools(
+        self,
+        system_prompt: str,
+        user_message: str,
+        tools: List[Dict[str, Any]],
+        tool_executor,
+        history: Optional[List[Dict[str, str]]] = None,
+        temperature: float = 0.8,
+        max_tokens: int = 1000,
+    ) -> str:
+        """支持函数调用（tool calling）的聊天接口
+
+        当 LLM 决定调用工具时，自动执行工具并将结果返回给 LLM，
+        循环最多3轮防止死循环，最终返回 LLM 的文本回复。
+
+        Args:
+            system_prompt: 系统提示词
+            user_message: 用户消息
+            tools: OpenAI tool schema 列表
+            tool_executor: 可调用对象，接收 (tool_name, arguments_dict)，返回字符串
+            history: 历史对话
+            temperature: 温度
+            max_tokens: 最大 token
+
+        Returns:
+            LLM 最终回复文本
+        """
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt}
+        ]
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": user_message})
+
+        # 强化 system 消息
+        messages = self._enforce_system_prompt(messages)
+        self._log_prompt(messages)
+
+        import json as _json
+
+        for _round in range(3):
+            try:
+                logger.info(f"工具调用第{_round}轮: model={self.model_name}")
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    tools=tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except Exception as e:
+                logger.error(f"工具调用 LLM 请求失败: {e}")
+                return ""
+
+            msg = response.choices[0].message
+
+            # 如果没有工具调用，直接返回文本
+            if not msg.tool_calls:
+                content = msg.content or ""
+                logger.debug(f"LLM 工具调用结束，回复: {content[:100]}...")
+                return content.strip()
+
+            # 将 assistant 消息（含 tool_calls）加入对话
+            messages.append(msg.model_dump())
+
+            # 执行每个工具调用
+            for tc in msg.tool_calls:
+                fn_name = tc.function.name
+                try:
+                    fn_args = _json.loads(tc.function.arguments or "{}")
+                except Exception:
+                    fn_args = {}
+                logger.info(f"执行工具: {fn_name}({fn_args})")
+                try:
+                    result = tool_executor(fn_name, fn_args)
+                except Exception as e:
+                    result = f"工具执行失败: {e}"
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": str(result),
+                })
+
+        # 超过3轮，取最后一轮的文本
+        logger.warning("工具调用超过3轮，强制结束")
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return (response.choices[0].message.content or "").strip()
+        except Exception as e:
+            logger.error(f"工具调用最终回复失败: {e}")
+            return ""
+
     def chat_multimodal(
         self,
         system_prompt: str,

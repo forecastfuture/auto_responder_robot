@@ -212,3 +212,53 @@ class MemoryManager:
         if not memories:
             return ""
         return f"关于{user_name}的记忆: {'; '.join(memories)}"
+
+    # ==================== 历史搜索 ====================
+
+    def search_history(
+        self,
+        keyword: str,
+        chat_name: str = "",
+        limit: int = 20,
+    ) -> List[Dict[str, str]]:
+        """按关键词搜索对话历史记录
+
+        Args:
+            keyword: 搜索关键词
+            chat_name: 会话名称（为空则搜索所有会话）
+            limit: 最多返回条数
+
+        Returns:
+            匹配的对话记录列表，格式为:
+            [{"sender": "...", "chat": "...", "content": "...",
+              "role": "...", "timestamp": "..."}, ...]
+        """
+        if not keyword.strip():
+            return []
+        with self._get_conn() as conn:
+            pattern = f"%{keyword}%"
+            if chat_name:
+                rows = conn.execute(
+                    "SELECT user_name, group_name, content, role, timestamp "
+                    "FROM messages WHERE group_name = ? AND content LIKE ? "
+                    "ORDER BY id DESC LIMIT ?",
+                    (chat_name, pattern, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT user_name, group_name, content, role, timestamp "
+                    "FROM messages WHERE content LIKE ? "
+                    "ORDER BY id DESC LIMIT ?",
+                    (pattern, limit),
+                ).fetchall()
+        results = []
+        for row in rows:
+            results.append({
+                "sender": row["user_name"],
+                "chat": row["group_name"],
+                "content": row["content"],
+                "role": row["role"],
+                "timestamp": row["timestamp"],
+            })
+        logger.info(f"搜索历史「{keyword}」命中 {len(results)} 条")
+        return results
