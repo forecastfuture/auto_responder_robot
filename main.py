@@ -154,6 +154,18 @@ def build_cron_system_prompt(persona: Persona, chat_name: str, raw_message: str)
     evening_kw = ["晚上好", "晚安", "晚安好", "晚好"]
 
     if any(kw in raw_message for kw in morning_kw):
+        # 预查询天气数据，注入提示词供 LLM 播报
+        weather_info = ""
+        try:
+            weather_info = WeatherTool.get_weather("重庆渝北")
+            logger.info(f"定时早安天气查询成功: {weather_info[:100]}")
+        except Exception as e:
+            logger.warning(f"定时早安天气查询失败: {e}")
+
+        weather_section = ""
+        if weather_info and "未找到" not in weather_info:
+            weather_section = f"\n### 今日天气预报\n{weather_info}\n"
+
         instruction += (
             "\n### 早安运势占卜\n"
             "这是早安问候。在问候之后，请附带今日运势占卜，格式参考：\n"
@@ -162,6 +174,8 @@ def build_cron_system_prompt(persona: Persona, chat_name: str, raw_message: str)
             "- 宜（1~2件适合做的事）\n"
             "- 忌（1~2件不宜做的事）\n"
             "- 一句简短运势提醒\n"
+            f"{weather_section}"
+            "请根据上面提供的天气预报数据，用你自己的风格简短播报今日天气情况。\n"
             "运势内容每次随机生成，轻松有趣，像一只高冷小猫给主人的每日运势播报。\n"
             "整体控制在5行以内。\n"
         )
