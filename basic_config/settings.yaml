@@ -20,7 +20,7 @@ REPLY_CHATS:
   - '测试群'
   - 'angel'
   - '三月'
-#  - '南天湖🎈🎈'
+  - 'ktv🎈🎈'
 
 # 设置定时任务
 CRON_TASKS:
