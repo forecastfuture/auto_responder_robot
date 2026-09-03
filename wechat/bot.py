@@ -11,9 +11,16 @@ pywechat 通过 pywinauto 自动化 Windows 微信客户端实现消息收发。
     - 监听群消息（通过轮询会话列表新消息）
     - 获取会话列表
     - 拉取指定会话最近N条消息（含图片）
+
+已知限制:
+    微信 4.1.8+ 客户端会忽略程序注入的右键点击（真实鼠标才能弹出消息右键菜单），
+    pyweixin.pull_messages 依赖的右键'多选'菜单在该版本上无法打开。
+    因此拉取消息改为 UIA 直读聊天区消息行：内容/类型来自消息行本身，
+    发送人通过会话预览（'三月: xxx'）与已发送内容匹配解析，详见 _pull_messages_uia。
 """
 
 import os
+import re
 import time
 from typing import List, Optional, Any
 
@@ -26,6 +33,12 @@ _IMAGE_TYPES = {"图片", "image", "[图片]", "[image]"}
 
 # 图片保存目录（data/images/）
 _IMAGE_SAVE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "images")
+
+# 时间戳等系统消息行的 UI 类名（不是真正的消息）
+_SYSTEM_ROW_CLASS = "mmui::ChatItemView"
+
+# 单次拉取最大尝试次数
+_PULL_MAX_ATTEMPTS = 3
 
 
 class WeChatMessage:
@@ -104,6 +117,8 @@ class WeChatBot:
         self._sent_contents_ordered: list = []
         self._recent_context: dict = {}  # {chat_name: [WeChatMessage, ...]} 缓存最近拉取的消息（按时间正序）
         self._pull_fail_cooldown: dict = {}  # {chat_name: expiry_timestamp} 拉取失败冷却，期间跳过该会话
+        self._session_previews: dict = {}  # {chat_name: 会话预览文本('发送人: 内容')} 用于解析发送人
+        self._sender_cache: dict = {}  # {(chat, content): sender} 群聊发送人缓存（由预览解析回填）
 
     def init_wechat(self) -> bool:
         """初始化微信连接，验证客户端已运行并登录"""
@@ -207,6 +222,7 @@ class WeChatBot:
             return saved_files
         except Exception as e:
             logger.error(f"保存图片失败: {e}")
+            self._recover_wechat_ui_state(3)
             return []
 
     def _attach_image_paths(self, msgs: List[WeChatMessage], friend: str) -> None:
@@ -235,6 +251,165 @@ class WeChatBot:
                 img_msg.image_path = saved_paths[i]
                 logger.info(f"图片消息已关联: {img_msg.sender} -> {saved_paths[i]}")
 
+    def _ensure_wechat_foreground(self, main_window=None) -> None:
+        """尽力把微信主窗口带到前台（ALT 技巧绕过 SetForegroundWindow 限制）
+
+        UIA 读取本身不依赖前台，但键盘输入（ESC 清理等）只作用于前台窗口。
+        """
+        try:
+            import win32api
+            import win32con
+            import win32gui
+
+            if main_window is None:
+                return
+            try:
+                main_window.set_focus()
+                time.sleep(0.15)
+            except Exception:
+                pass
+            try:
+                if win32gui.GetForegroundWindow() != main_window.handle:
+                    win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+                    try:
+                        win32gui.SetForegroundWindow(main_window.handle)
+                    finally:
+                        win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+                    time.sleep(0.15)
+            except Exception:
+                pass
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"激活微信窗口失败(可忽略): {e}")
+
+    def _recover_wechat_ui_state(self, esc_count: int = 3) -> None:
+        """拉取失败后的 UI 自愈：发送多次 ESC 清理残留状态"""
+        count = max(1, int(esc_count))
+        try:
+            from pywinauto.keyboard import send_keys
+            for _ in range(count):
+                send_keys('{ESC}')
+                time.sleep(0.2)
+            logger.info(f"微信 UI 状态恢复完成（已发送 {count} 次 ESC）")
+        except Exception as e:
+            logger.debug(f"UI 状态恢复失败(可忽略): {e}")
+
+    def _is_multiselect_active(self) -> bool:
+        """检测聊天区是否残留'多选'模式（存在 CheckBox 即处于多选状态）"""
+        if not self._initialized:
+            return False
+        try:
+            from pyweixin import GlobalConfig, Navigator
+            from pyweixin.Uielements import Lists
+
+            main_window = Navigator.open_weixin(is_maximize=GlobalConfig.is_maximize)
+            chat_list = main_window.child_window(**Lists.FriendChatList)
+            return bool(chat_list.children(control_type="CheckBox"))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _parse_preview_sender(preview: str):
+        """解析会话预览 '三月: 下午好' -> ('三月', '下午好'); 无前缀返回 (None, None)"""
+        text = (preview or "").strip()
+        if not text:
+            return None, None
+        m = re.match(r"^([^:：\n]{1,30})[:：]\s*(.+)$", text, re.S)
+        if not m:
+            return None, None
+        return m.group(1).strip(), m.group(2).strip()
+
+    @staticmethod
+    def _preview_matches(preview_content: str, content: str) -> bool:
+        """会话预览内容与消息行内容匹配（兼容预览被截断为省略号的情况）"""
+        a = " ".join((preview_content or "").split()).rstrip(".…")
+        b = " ".join((content or "").split())
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        return len(a) >= 4 and (b.startswith(a) or a.startswith(b))
+
+    def _resolve_sender(self, chat: str, content: str, is_group: bool, friend: str,
+                        preview_sender: Optional[str] = None) -> str:
+        """确定消息发送人
+
+        优先级: 已发送内容匹配(自己) > 会话预览('你'/群成员名) > 发送人缓存 > 私聊好友名 > '群成员'
+        群聊中由预览解析出的发送人会写入缓存，同内容的历史行可直接复用。
+        """
+        if self._is_self_message("", content):
+            return self._my_name or "你"
+        if preview_sender == "你":
+            return self._my_name or "你"
+        norm = " ".join(content.split())
+        if preview_sender:
+            if is_group:
+                key = (chat, norm)
+                if key not in self._sender_cache:
+                    self._sender_cache[key] = preview_sender
+                    if len(self._sender_cache) > 500:
+                        self._sender_cache.pop(next(iter(self._sender_cache)))
+                return preview_sender
+            return friend
+        cached = self._sender_cache.get((chat, norm))
+        if cached:
+            return cached
+        if not is_group:
+            return friend
+        return "群成员"
+
+    @staticmethod
+    def _row_to_type(class_name: str, content: str) -> str:
+        """按消息行 UI 类名与前后缀推断消息类型（与库 parse_messages 规则一致）"""
+        try:
+            from pyweixin.Uielements import Special_Labels
+            L = Special_Labels
+            image_label, video_label, file_label = L.Image, L.Video, L.File
+            link_label, miniprogram_label = L.Link, L.MiniProgram
+            channels_label, redpacket_label = L.Channels, L.RedPacket
+            transfer_label, chat_history_label = L.Transfer, L.ChatHistory
+            voiceCall_label, videoCall_label = L.VoiceCall, L.VideoCall
+            emoji_label = L.Emoji
+        except Exception:
+            image_label, video_label, file_label = "[图片]", "[视频]", "[文件]"
+            link_label, miniprogram_label = "[链接]", "[小程序]"
+            channels_label, redpacket_label = "[视频号]", "[微信红包]"
+            transfer_label, chat_history_label = "[微信转账]", "[聊天记录]"
+            voiceCall_label, videoCall_label, emoji_label = "[语音通话]", "[视频通话]", "[动画表情]"
+
+        if class_name == "mmui::ChatPersonalCardItemView":
+            return "好友名片"
+        if class_name == "mmui::ChatBubbleReferItemView":
+            if content.startswith(image_label):
+                return "图片"
+            if content.startswith(video_label):
+                return "视频"
+            if content.startswith(emoji_label):
+                return "动画表情"
+            return "文本"
+        if class_name == "mmui::ChatBubbleItemView":
+            if content.startswith(file_label):
+                return "文件"
+            if content.startswith(link_label):
+                return "链接"
+            if content.startswith(miniprogram_label):
+                return "小程序"
+            if content.startswith(channels_label):
+                return "视频号"
+            if content.endswith(redpacket_label):
+                return "微信红包"
+            if content.endswith(transfer_label):
+                return "微信转账"
+            if content.startswith(chat_history_label):
+                return "聊天记录"
+            if content.startswith(voiceCall_label):
+                return "语音通话"
+            if content.startswith(videoCall_label):
+                return "视频通话"
+            return "文本"
+        return "文本"
+
     @staticmethod
     def _dismiss_ui_popups():
         """尝试按Escape关闭微信中残留的UI弹窗/菜单（如'多选'菜单）"""
@@ -245,43 +420,94 @@ class WeChatBot:
         except Exception as e:
             logger.debug(f"发送ESC键失败(可忽略): {e}")
 
-    def _pull_messages_safe(self, friend: str, number: int = 5) -> list:
-        """带重试的 pull_messages 封装
+    def _pull_messages_uia(self, friend: str, number: int = 5) -> list:
+        """直接读取聊天区可见消息行（不依赖右键菜单）
 
-        首次以 close_weixin=False 拉取消息；若失败（如遇到 UI 弹窗/多选菜单残留），
-        先按ESC关闭残留弹窗，再以 close_weixin=True 重试以重置微信窗口状态。
+        微信 4.1.8+ 忽略程序注入的右键点击，pyweixin 的 pull_messages 依赖
+        右键'多选'菜单，在该版本上必然失败。此方法改为纯 UIA 读取：
+            - 消息行的 class_name/window_text 直接给出内容与类型；
+            - 发送人通过 会话预览('三月: xxx') + 已发送内容匹配 解析，
+              私聊非自己即好友，群聊未识别的发送人记为'群成员'。
+
+        Returns:
+            [{'消息发送人','消息内容','消息类型'}...] 最新在前（与库 pull_messages 一致）
         """
-        from pyweixin import Messages
+        from pyweixin import Navigator, Tools
+        from pyweixin.Uielements import Lists
 
-        # 第一次尝试
+        main_window = Navigator.open_dialog_window(friend=friend)
+        self._ensure_wechat_foreground(main_window)
+        chat_list = main_window.child_window(**Lists.FriendChatList)
+        rows = chat_list.children(control_type="ListItem")
+
         try:
-            msg_list = Messages.pull_messages(
-                friend=friend, number=number, close_weixin=False,
-            )
-            return msg_list or []
-        except Exception as first_err:
-            err_desc = self._format_ui_error(first_err)
-            logger.warning(
-                f"拉取 '{friend}' 消息首次失败({err_desc})，尝试ESC+重试"
-            )
+            is_group = Tools.is_group_chat(main_window)
+        except Exception:
+            is_group = False
 
-        # 按ESC关闭残留的弹窗/菜单（如"多选"菜单）
-        self._dismiss_ui_popups()
-        time.sleep(0.5)
+        preview = self._session_previews.get(friend, "")
+        preview_sender, preview_content = self._parse_preview_sender(preview)
 
-        # 第二次尝试：close_weixin=True 关闭聊天窗口以清除残留弹窗/菜单
-        try:
-            msg_list = Messages.pull_messages(
-                friend=friend, number=number, close_weixin=True,
+        # [(class_name, content)] 按时间正序, 跳过时间戳等系统行
+        items = []
+        for row in rows:
+            try:
+                cls = row.class_name() or ""
+                text = (row.window_text() or "").strip()
+            except Exception:
+                continue
+            if cls == _SYSTEM_ROW_CLASS:
+                continue
+            items.append((cls, text))
+        if number > 0:
+            items = items[-number:]
+
+        # 定位与预览匹配的行（取最后一条匹配，预览对应会话最新一条消息）
+        match_idx = None
+        for idx, (_, text) in enumerate(items):
+            if self._preview_matches(preview_content or "", text or "[图片]"):
+                match_idx = idx
+
+        details = []
+        for idx, (cls, text) in enumerate(items):
+            content = text or "[图片]"  # 图片等无文本行
+            msg_type = self._row_to_type(cls, content)
+            use_preview = match_idx is not None and idx == match_idx and preview_sender
+            sender = self._resolve_sender(
+                friend, content, is_group, friend,
+                preview_sender if use_preview else None,
             )
-            logger.info(f"重试拉取 '{friend}' 消息成功")
-            return msg_list or []
-        except Exception as second_err:
-            err_desc = self._format_ui_error(second_err)
-            logger.error(
-                f"重试拉取 '{friend}' 消息仍然失败({err_desc})，跳过该会话本轮消息"
-            )
-            return []
+            details.append({"消息发送人": sender, "消息内容": content, "消息类型": msg_type})
+
+        details.reverse()  # 最新在前
+        return details
+
+    def _pull_messages_safe(self, friend: str, number: int = 5) -> list:
+        """带重试与 UI 自愈的拉取封装（最多 _PULL_MAX_ATTEMPTS 次）
+
+        每次失败后发送 ESC 清理残留状态并重试；全部失败返回空列表，
+        由调用方设置冷却期跳过该会话。
+        """
+        last_err: Optional[Exception] = None
+        for attempt in range(1, _PULL_MAX_ATTEMPTS + 1):
+            try:
+                msg_list = self._pull_messages_uia(friend, number=number)
+                if attempt > 1:
+                    logger.info(f"第 {attempt} 次拉取 '{friend}' 消息成功")
+                return msg_list or []
+            except Exception as e:
+                last_err = e
+                err_desc = self._format_ui_error(e)
+                suffix = "，恢复微信 UI 状态后重试" if attempt < _PULL_MAX_ATTEMPTS else ""
+                logger.warning(f"拉取 '{friend}' 消息第 {attempt} 次失败({err_desc}){suffix}")
+                if attempt < _PULL_MAX_ATTEMPTS:
+                    self._recover_wechat_ui_state(esc_count=3 * attempt)
+                    time.sleep(0.5)
+        logger.error(
+            f"拉取 '{friend}' 消息 {_PULL_MAX_ATTEMPTS} 次均失败("
+            f"{self._format_ui_error(last_err)})，跳过该会话本轮消息"
+        )
+        return []
 
     @staticmethod
     def _format_ui_error(exc: Exception) -> str:
@@ -426,6 +652,7 @@ class WeChatBot:
                         ts = s[1] if len(s) > 1 else ""
                         content = s[2] if len(s) > 2 else ""
                         self._session_snapshot[friend] = f"{ts}|{content}"
+                        self._session_previews[friend] = content
                 self._first_scan = False
                 logger.info(f"首次扫描完成，建立 {len(self._session_snapshot)} 个会话基线")
                 return []
@@ -447,6 +674,7 @@ class WeChatBot:
                     continue
                 ts = s[1] if len(s) > 1 else ""
                 content = s[2] if len(s) > 2 else ""
+                self._session_previews[friend] = content
                 current_sig = f"{ts}|{content}"
                 prev_sig = self._session_snapshot.get(friend)
                 if prev_sig is None or current_sig != prev_sig:
