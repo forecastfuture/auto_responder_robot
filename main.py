@@ -295,6 +295,53 @@ def setup_cron_tasks(
     logger.info(f"共注册 {registered} 个定时任务")
 
 
+def relogin_wechat(wx_bot: WeChatBot, full_logout: bool = False):
+    """定时任务回调：重新登录微信，防止长时间运行后连接超时退出
+
+    Args:
+        wx_bot: 微信机器人实例
+        full_logout: 为 True 时先主动退出登录再重新登录（完整重登）；
+                     为 False 时仅在已登录状态下刷新连接（保持在线）。
+    """
+    try:
+        mode = "退出登录后重新登录" if full_logout else "刷新连接保持在线"
+        logger.info(f"开始执行定时自动重新登录微信（{mode}）...")
+        ok = wx_bot.relogin(full_logout=full_logout)
+        if ok:
+            logger.info("定时自动重新登录微信成功")
+        else:
+            logger.error("定时自动重新登录微信失败，请检查微信客户端状态")
+    except Exception as e:
+        logger.error(f"定时自动重新登录微信异常: {e}", exc_info=True)
+
+
+def setup_relogin_task(scheduler: TaskScheduler, wx_bot: WeChatBot):
+    """从 settings.yaml 加载 AUTO_RELOGIN 配置并注册每日自动重新登录任务
+
+    配置格式（settings.yaml 中）:
+        AUTO_RELOGIN: "00:00"          # 每天 00:00 自动重新登录微信，防止超时退出
+        AUTO_RELOGIN_FULL_LOGOUT: false # true 时先退出登录再重登（完整重登）
+    留空或未配置 AUTO_RELOGIN 则不注册。
+    """
+    relogin_time = str(settings.get("AUTO_RELOGIN") or "").strip()
+    if not relogin_time:
+        logger.info("未配置 AUTO_RELOGIN，跳过自动重新登录任务")
+        return
+    full_logout = bool(settings.get("AUTO_RELOGIN_FULL_LOGOUT"))
+    try:
+        scheduler.add_daily_task(
+            relogin_wechat,
+            relogin_time,
+            task_id="auto_relogin",
+            wx_bot=wx_bot,
+            full_logout=full_logout,
+        )
+        mode = "退出后重登" if full_logout else "刷新保活"
+        logger.info(f"已注册每日自动重新登录任务: {relogin_time}（{mode}）")
+    except Exception as e:
+        logger.error(f"注册自动重新登录任务失败: {e}", exc_info=True)
+
+
 def main():
     """主函数：初始化微信 + 大模型，轮询消息并自动回复"""
 
@@ -326,6 +373,7 @@ def main():
     # --- 初始化定时任务调度器 ---
     scheduler = TaskScheduler()
     setup_cron_tasks(scheduler, wx_bot, llm, persona)
+    setup_relogin_task(scheduler, wx_bot)
     scheduler.start()
 
     logger.info("=" * 50)

@@ -153,6 +153,235 @@ class WeChatBot:
             logger.error(f"微信初始化失败: {e}")
             return False
 
+    def is_logged_in(self) -> bool:
+        """检测微信客户端当前是否处于登录状态
+
+        通过尝试打开主窗口判断：能定位到主界面(mmui::MainWindow)即已登录；
+        处于登录窗口(mmui::LoginWindow)或微信未启动时均返回 False。
+
+        Returns:
+            True 表示微信已登录且可进行 UI 自动化操作
+        """
+        try:
+            from pyweixin import Navigator
+
+            Navigator.open_weixin(is_maximize=False)
+            return True
+        except Exception as e:
+            logger.debug(f"微信登录状态检测: 未登录或不可用 ({self._format_ui_error(e)})")
+            return False
+
+    def _reset_session_state(self) -> None:
+        """重新登录成功后重置会话缓存，重新建立消息基线
+
+        清空会话快照/预览/发送人缓存等，并将 _first_scan 置为 True，
+        使下一次扫描重新建立基线，避免把历史消息当成新消息重复回复。
+        保留 _seen_messages 以防止对同一消息二次回复。
+        """
+        self._session_snapshot.clear()
+        self._session_previews.clear()
+        self._sender_cache.clear()
+        self._recent_context.clear()
+        self._pull_fail_cooldown.clear()
+        self._first_scan = True
+
+    def _is_login_window(self) -> bool:
+        """检测微信当前是否停留在登录窗口（mmui::LoginWindow）"""
+        try:
+            from pywinauto import Desktop
+            from pyweixin.Uielements import Login_window
+
+            login_window = Desktop(backend="uia").window(**Login_window.LoginWindow)
+            return bool(login_window.exists(timeout=1))
+        except Exception as e:
+            logger.debug(f"登录窗口检测异常: {self._format_ui_error(e)}")
+            return False
+
+    def _click_enter_weixin(self) -> bool:
+        """在登录窗口点击'进入微信'按钮，用已记住的账号自动重登（无需扫码）
+
+        微信 4.x 退出登录后停留在登录窗口，若账号被记住会显示'进入微信'按钮，
+        点击即可免扫码重新登录。找不到按钮时返回 False，由调用方回退到扫码流程。
+        """
+        try:
+            from pywinauto import Desktop
+            from pyweixin.Uielements import Login_window
+
+            login_window = Desktop(backend="uia").window(**Login_window.LoginWindow)
+            if not login_window.exists(timeout=3):
+                logger.warning("未找到微信登录窗口，无法自动点击'进入微信'")
+                return False
+            try:
+                login_window.restore()
+            except Exception:
+                pass
+            enter_btn = login_window.child_window(**Login_window.LoginButton)
+            if not enter_btn.exists(timeout=2):
+                logger.info("登录窗口未出现'进入微信'按钮，可能需要扫码登录")
+                return False
+            enter_btn.click_input()
+            logger.info("已点击'进入微信'按钮，正在自动重新登录...")
+            return True
+        except Exception as e:
+            logger.warning(f"点击'进入微信'按钮失败: {self._format_ui_error(e)}")
+            return False
+
+    def _wait_logged_in(self, timeout: int = 180, poll_interval: int = 3) -> bool:
+        """轮询等待微信进入已登录状态，成功后重置会话缓存
+
+        Returns:
+            True 表示在超时前检测到已登录；False 表示超时或微信已退出
+        """
+        from pyweixin import Navigator
+        from pyweixin.Errors import NotLoginError, NotStartError
+
+        deadline = time.time() + max(0, int(timeout))
+        while time.time() < deadline:
+            time.sleep(poll_interval)
+            try:
+                Navigator.open_weixin(is_maximize=False)
+                logger.info("检测到微信已登录，重新登录成功")
+                self._reset_session_state()
+                self._initialized = True
+                return True
+            except NotLoginError:
+                continue
+            except NotStartError:
+                logger.error("微信已退出，重新登录中止")
+                self._initialized = False
+                return False
+            except Exception:
+                continue
+        return False
+
+    def logout(self, wait_seconds: int = 15) -> bool:
+        """主动退出当前微信账号登录，使微信回到登录窗口
+
+        通过 pyweixin Settings.Log_out 打开设置 → 点击'退出登录' → '确定'。
+        退出后微信停留在登录窗口(mmui::LoginWindow)，可再用 relogin() 重新登录。
+
+        Args:
+            wait_seconds: 等待确认已进入登录窗口的最长秒数，默认 15
+
+        Returns:
+            True 表示已确认退出登录（处于登录窗口或未登录状态）
+        """
+        if not self.is_logged_in():
+            logger.info("微信当前未登录，无需退出")
+            self._initialized = False
+            return True
+        try:
+            from pyweixin import Settings
+        except ImportError:
+            logger.error("pywechat 未安装，无法退出登录")
+            return False
+
+        try:
+            logger.info("正在退出微信登录...")
+            Settings.Log_out(is_maximize=False, close_weixin=False)
+        except Exception as e:
+            logger.error(f"退出登录操作失败: {self._format_ui_error(e)}")
+            return False
+
+        deadline = time.time() + max(0, int(wait_seconds))
+        while time.time() < deadline:
+            time.sleep(1)
+            if self._is_login_window():
+                self._initialized = False
+                logger.info("微信已退出登录，当前停留在登录窗口")
+                return True
+
+        if self.is_logged_in():
+            logger.error("退出登录后仍处于已登录状态，退出可能未生效")
+            return False
+        self._initialized = False
+        logger.info("微信已退出登录")
+        return True
+
+    def relogin(self, wait_seconds: int = 180, full_logout: bool = False) -> bool:
+        """重新登录 / 刷新微信连接（供每日定时任务调用）
+
+        防止机器人长时间运行后因连接超时、微信掉线而失效。
+
+        Args:
+            wait_seconds: 掉线后等待登录成功的最长秒数，默认 180
+            full_logout: 为 True 时先主动退出登录再重新登录（完整验证退出/重登流程）；
+                         为 False 时仅在已登录状态下刷新连接（保持在线，防止超时退出）。
+
+        流程:
+            1. full_logout=True 且当前已登录 → 先 logout() 退出到登录窗口；
+            2. 确认微信进程在运行，未运行则尝试启动；
+            3. 检测登录状态:
+               - 已登录: 刷新自动化连接并重置会话缓存；
+               - 未登录(登录窗口): 先尝试点击'进入微信'自动重登，
+                 失败则保存登录二维码到 data/images/login_qrcode.png 并轮询等待扫码。
+
+        Returns:
+            True 表示操作结束后微信处于登录状态
+        """
+        try:
+            from pyweixin import Navigator, Tools
+            from pyweixin.Errors import NotLoginError, NotStartError
+        except ImportError:
+            logger.error("pywechat 未安装，无法重新登录微信")
+            return False
+
+        # 0. 需要完整退出/重登时，先主动退出登录
+        if full_logout:
+            logger.info("full_logout=True，先主动退出登录再重新登录")
+            self.logout()
+
+        # 1. 确保微信进程在运行
+        try:
+            if not Tools.is_weixin_running():
+                logger.warning("微信进程未运行，尝试启动微信...")
+                exe_path = Tools.where_weixin()
+                if exe_path:
+                    os.startfile(exe_path)
+                    time.sleep(8)
+        except Exception as e:
+            logger.warning(f"检查/启动微信进程失败: {e}")
+
+        # 2. 已登录 → 刷新连接并重置会话缓存
+        try:
+            Navigator.open_weixin(is_maximize=False)
+            logger.info("微信已处于登录状态，刷新连接并重置会话缓存")
+            self._reset_session_state()
+            self._initialized = True
+            return True
+        except NotLoginError:
+            logger.warning("微信当前未登录，尝试重新登录...")
+        except NotStartError:
+            logger.error("微信未启动，无法重新登录")
+            self._initialized = False
+            return False
+        except Exception as e:
+            logger.warning(f"登录状态检测异常，按未登录处理: {self._format_ui_error(e)}")
+
+        # 3. 未登录 → 优先点击'进入微信'自动重登（记住的账号无需扫码）
+        if self._click_enter_weixin():
+            if self._wait_logged_in(timeout=min(30, max(5, wait_seconds))):
+                return True
+            logger.warning("点击'进入微信'后仍未登录，回退到扫码登录")
+
+        # 4. 回退：保存二维码并轮询等待扫码登录
+        qr_path = os.path.join(_IMAGE_SAVE_DIR, "login_qrcode.png")
+        try:
+            os.makedirs(_IMAGE_SAVE_DIR, exist_ok=True)
+            Tools.capture_Login_QRCode(qr_path)
+            logger.info(
+                f"已保存微信登录二维码: {qr_path}，请在 {wait_seconds} 秒内扫码登录"
+            )
+        except Exception as e:
+            logger.error(f"获取登录二维码失败: {e}")
+
+        if self._wait_logged_in(timeout=wait_seconds):
+            return True
+
+        logger.error("等待登录超时，微信仍未登录")
+        self._initialized = False
+        return False
+
     def _is_self_message(self, sender: str, content: str) -> bool:
         """判断消息是否为自己发送的（发送者名称匹配 + 已回复内容匹配）"""
         s = sender.strip()
